@@ -11,6 +11,28 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- Dense EXL3 for the non-routed linears (`GLM53_DENSE_EXL3`, default `0`,
+  experimental/opt-in; `overlay/exl3.py` `[dense-exl3]`, constructor
+  patches ride `overlay/patch_dense_fp8.py`): serve a pack whose
+  `quantization_config.non_routed_exl3` block declares EXL3 tensors for the
+  dense projections (turboderp 4.05bpw overlay: attn K6, shared K6, dense
+  MLP K5, mul1 codebook; 191 modules). Per module mutually exclusive with
+  `GLM53_DENSE_FP8` and with `ABLIT` — launchers refuse pre-stop, the
+  overlay refuses at load; a `non_routed_exl3` pack with the flag off
+  refuses to boot; TP=2 only. `GLM53_KDA_BF16_LARGE_M=1` is supported on
+  the EXL3 KDA in_proj: a load-time fp16 copy of the dequantized q/k/v
+  shards + the bf16 tail serves M>512 prefill with the custom op's exact
+  arithmetic (decode stays on EXL3; ~3.3 GiB/rank). Measured at
+  262k/2seqs/MNBT 1024/util 0.83 (README "Dense EXL3" section): quality at
+  parity with FP8 `dense,kda` (paired contrast +0.0012 nats,
+  CI [−0.0005, +0.0029]; top-1 94.39 vs 94.04), decode faster on every
+  probe (+2.9 to +10.7 %), KV pool +53 %, cold prefill −9.5 %
+  (−6.6 % with the large-M copy). Known limits in the README section
+  (TP=2 only, ABLIT incompatible, lm_head/draft stay BF16). The
+  stock-profile CUDA-graph boot hang (exllamav3 coop autotuner tuning a
+  first-seen GEMM shape inside capture) is fixed by an eager
+  shape-x-row-bucket autotune warmup at the end of weight load.
+
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not

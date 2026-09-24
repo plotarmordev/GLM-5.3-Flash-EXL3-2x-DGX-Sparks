@@ -420,6 +420,11 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # TP=3 local shape [8726x4096] (64→66 head pad). Changes target numerics
 # (see docs/kda-bf16-large-m.md); default off.
 GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
+# Dense-EXL3 for the non-routed linears (overlay/exl3.py [dense-exl3]; README
+# env table). Mutually exclusive with GLM53_DENSE_FP8 and ABLIT;
+# GLM53_KDA_BF16_LARGE_M=1 is supported (EXL3 in_proj reconstruct path);
+# TP=2 only.
+GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}"
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
@@ -683,6 +688,33 @@ validate_numeric_config() {
         # DFlash-only boundary lookup; the allocator also refuses them in-container.
         echo "GLM53_DRAFT_KV_COMPACT=1 requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
+    fi
+    _glm53_validate_bool_flag GLM53_DENSE_EXL3 "${GLM53_DENSE_EXL3-0}" || return
+    # Dense EXL3 owns the same dense modules the FP8/BF16 overlays target and
+    # every o_proj; refuse the mix here (pre-stop) — overlay/exl3.py raises
+    # per module at load as the in-container backstop.
+    if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
+        case "${GLM53_DENSE_FP8:-off}" in
+            ""|off|0|no|none) ;;
+            *) echo "GLM53_DENSE_EXL3=1 requires GLM53_DENSE_FP8=off (got: ${GLM53_DENSE_FP8}) — the dense-EXL3 pack covers every FP8 group's modules" >&2
+               return 2 ;;
+        esac
+        if [ "${ABLIT-0}" = "1" ]; then
+            echo "GLM53_DENSE_EXL3=1 requires ABLIT=0 — a dense-EXL3 pack quantizes o_proj on every layer; ABLIT edits BF16 o_proj only" >&2
+            return 2
+        fi
+    else
+        # Pre-stop mirror of the in-container pack/flag refusal
+        # (overlay/patch_dense_fp8.py): a non_routed_exl3 pack must not boot
+        # with the flag off. Best-effort on the host snapshot; the container
+        # re-checks.
+        local _snap="${MODEL_SNAPSHOT:-}"
+        [ -n "$_snap" ] || { [ -f "$MODEL_PATH/refs/main" ] && _snap="$(<"$MODEL_PATH/refs/main")"; }
+        if [ -n "$_snap" ] && [ -f "$MODEL_PATH/snapshots/$_snap/config.json" ] \
+           && grep -q '"non_routed_exl3"' "$MODEL_PATH/snapshots/$_snap/config.json"; then
+            echo "GLM53_DENSE_EXL3=0 but the model pack carries non_routed_exl3 — set GLM53_DENSE_EXL3=1 or serve a non-dense pack" >&2
+            return 2
+        fi
     fi
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
@@ -2074,7 +2106,7 @@ launch_cluster() {
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M \
+             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M GLM53_DENSE_EXL3 \
              GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
@@ -2262,6 +2294,7 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_SATURATE="$GLM53_ADAPTIVE_K_SATURATE" \
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
+        -e GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}" \
         -e GLM53_EXL3_MOE_FAST="$GLM53_EXL3_MOE_FAST" \
         -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
