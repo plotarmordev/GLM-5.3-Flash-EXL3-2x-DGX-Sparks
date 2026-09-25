@@ -1825,9 +1825,23 @@ class Exl3Config(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+        )
 
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(layer.moe_config, self)
+        if isinstance(layer, ParallelLMHead):
+            # [dense-exl3] pack-declared EXL3 lm_head (the 4.05bpw overlay can
+            # carry lm_head K6 mul1). Matched by the exact runtime prefix
+            # (language_model.lm_head in the vision-wrapped model). A
+            # non-matching head — and always embed_tokens, a plain
+            # VocabParallelEmbedding — falls back to the unquantized method.
+            if self._matches_non_routed_exl3(prefix):
+                return Exl3LinearMethod(
+                    self, prefix, bits=self._bits_for_non_routed(prefix)
+                )
+            return None
         if isinstance(layer, LinearBase):
             # [dense-exl3] pack-declared dense EXL3 linears. Mutually
             # exclusive with the FP8-overlay groups on the same module:
@@ -2382,6 +2396,22 @@ class Exl3LinearMethod(LinearMethodBase):
         self.tp_size = int(getattr(layer, "tp_size", 1) or 1)
         self.replicated_shards = frozenset(getattr(layer, "replicated_shard_ids", ()) or ())
         self.in_per_partition = input_size_per_partition
+        # [dense-exl3] The ParallelLMHead is the only non-LinearBase layer
+        # this method serves: vLLM shards it as one contiguous block of the
+        # PADDED vocab per rank — exactly the column-shard narrow the loader
+        # already runs, as long as padded == org. GLM-5.3-Flash's vocab
+        # (154880) is a 64 multiple, so vLLM pads nothing (77440 rows/rank
+        # at TP2); refuse an actually-padded vocab rather than guess at
+        # pad-row encodings.
+        self.is_vocab_head = not isinstance(layer, LinearBase)
+        if self.is_vocab_head and output_size != int(
+            getattr(layer, "org_vocab_size", -1)
+        ):
+            raise ValueError(
+                f"[dense-exl3] {self.prefix}: padded vocab {output_size} != "
+                f"org vocab {getattr(layer, 'org_vocab_size', None)}; the "
+                "EXL3 lm_head requires a 64-aligned vocab"
+            )
 
         k_words = self.bits * 16
         for i, out_size in enumerate(self.output_sizes):
@@ -2523,6 +2553,22 @@ class Exl3LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not hasattr(layer, "trellis"):
             return
+        if self.is_vocab_head:
+            # [dense-exl3] LogitsProcessor routes a head_dtype that differs
+            # from the activation dtype through an unquantized-only branch
+            # that raises for quant methods — refuse at load, not at the
+            # first request (the recipe never sets head_dtype; an
+            # --hf-overrides fp32 head is the only way to hit this).
+            from vllm.config import get_current_vllm_config
+
+            mc = get_current_vllm_config().model_config
+            head_dtype = getattr(mc, "head_dtype", None)
+            if head_dtype is not None and head_dtype != getattr(mc, "dtype", None):
+                raise RuntimeError(
+                    f"[dense-exl3] {self.prefix}: head_dtype={head_dtype} "
+                    "needs the unquantized lm_head; unset it or drop the "
+                    "lm_head key from the pack"
+                )
         output_sizes = self.output_sizes
         bf16_shards = self.bf16_shards
 
@@ -2590,13 +2636,22 @@ class Exl3LinearMethod(LinearMethodBase):
             }
         )
         layer._exl3_dense_handle = len(_DENSE_EXL3_LAYERS) - 1
-        logger.info(
-            "[dense-exl3] %s active (K=%d, %d shards, bf16_shards=%s, custom op)",
-            self.prefix,
-            self.bits,
-            self.n_shards,
-            bf16_shards or "-",
-        )
+        if self.is_vocab_head:
+            logger.info(
+                "[dense-exl3] %s active (K=%d, vocab shard %d x %d, custom op)",
+                self.prefix,
+                self.bits,
+                self.output_sizes[0],
+                self.in_per_partition,
+            )
+        else:
+            logger.info(
+                "[dense-exl3] %s active (K=%d, %d shards, bf16_shards=%s, custom op)",
+                self.prefix,
+                self.bits,
+                self.n_shards,
+                bf16_shards or "-",
+            )
         if len(_DENSE_EXL3_LAYERS) >= len(_DENSE_EXL3_MODULES):
             # Last constructed module has loaded: one summary line for the
             # boot log. declared == built is already enforced (Exl3MoEMethod

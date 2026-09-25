@@ -366,8 +366,9 @@ terms — see the donor card before redistributing anything derived.
 codebook; 191 modules / 315 replaced tensors on GLM-5.3-Flash) instead of
 BF16. Requires `GLM53_DENSE_FP8=off` and `ABLIT=0` (refused otherwise);
 `GLM53_KDA_BF16_LARGE_M=1` is supported (below). Boot check: the log must
-show `[dense-exl3] 191 EXL3-dense modules loaded` — any other count means a
-pack/model mismatch (boots refuse loudly on that condition).
+show `[dense-exl3] 191 EXL3-dense modules loaded` (192 when the pack also
+carries the EXL3 `lm_head`, below) — any other count means a pack/model
+mismatch (boots refuse loudly on that condition).
 
 ### Building the overlay pack
 
@@ -383,6 +384,11 @@ python3 tools/dense_overlay.py --branch 4.05bpw \
     --prefix-rewrite model.language_model.:language_model.model.
 python3 tools/dense_overlay.py --branch 4.05bpw \
     --src <TR3 snapshot dir> --out <overlay dir> --verify
+# optional: also carry the EXL3 lm_head (K6 mul1, served key
+# language_model.lm_head; the DFlash2 draft shares the same head module)
+python3 tools/dense_overlay.py --branch 4.05bpw \
+    --src <TR3 snapshot dir> --out <overlay dir> \
+    --prefix-rewrite model.language_model.:language_model.model. --lm-head
 ```
 
 Expose the overlay as an HF-cache model: make its symlinks into the TR3
@@ -447,7 +453,11 @@ artifact of small chunks.
   `start-tp4.sh` refuses (not wired).
 - `ABLIT=1` is incompatible: the pack quantizes o_proj on every layer, and
   both sides refuse the combination.
-- lm_head and the DFlash2 draft stay BF16.
+- The DFlash2 draft stays BF16. `lm_head` is BF16 unless the pack was built
+  with `--lm-head`: then the head runs the same EXL3 custom op (K6 mul1,
+  77,440-row vocab shard per rank at TP=2, padded==org asserted at load) and
+  the draft's candidate step reads it through the shared head module —
+  decode-only effect, prefill logits unchanged per row.
 
 ## Why the overlay exists
 

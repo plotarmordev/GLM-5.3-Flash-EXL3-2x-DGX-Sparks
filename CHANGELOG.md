@@ -28,10 +28,22 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   CI [−0.0005, +0.0029]; top-1 94.39 vs 94.04), decode faster on every
   probe (+2.9 to +10.7 %), KV pool +53 %, cold prefill −9.5 %
   (−6.6 % with the large-M copy). Known limits in the README section
-  (TP=2 only, ABLIT incompatible, lm_head/draft stay BF16). The
+  (TP=2 only, ABLIT incompatible, the draft stays BF16). The
   stock-profile CUDA-graph boot hang (exllamav3 coop autotuner tuning a
   first-seen GEMM shape inside capture) is fixed by an eager
   shape-x-row-bucket autotune warmup at the end of weight load.
+
+- Optional EXL3 `lm_head` for dense-EXL3 packs (pack builder
+  `--lm-head`; `overlay/exl3.py` `[dense-exl3]`): turboderp's 4.05bpw
+  lm_head K6 (mul1) served through `Exl3LinearMethod` on the
+  `ParallelLMHead` — exact-prefix dispatch (`language_model.lm_head`;
+  `embed_tokens` can never match), contiguous 77,440-row vocab shard per
+  rank at TP=2, padded==org vocab asserted at create, `head_dtype`
+  differing from the model dtype refused at load. The DFlash2 draft shares
+  the target's head module object, so its candidate step reads the EXL3
+  head through the same custom op; the coop-autotune warmup covers the
+  head shape. Boot summary reads 192 modules with the key, 191 without;
+  packs without the key see no behaviour change.
 
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each

@@ -121,6 +121,17 @@ def _install_vllm_stubs(layer_types=None):
     fm_cfg = types.ModuleType("vllm.model_executor.layers.fused_moe.config")
     fm_cfg.FusedMoEQuantConfig = object
 
+    vpe = types.ModuleType("vllm.model_executor.layers.vocab_parallel_embedding")
+
+    class VocabParallelEmbedding(torch.nn.Module):
+        pass
+
+    class ParallelLMHead(VocabParallelEmbedding):
+        pass
+
+    vpe.VocabParallelEmbedding = VocabParallelEmbedding
+    vpe.ParallelLMHead = ParallelLMHead
+
     for mod in (vllm, vllm_logger, vllm_config_mod, vllm_quant, vllm_utils, fm_cfg):
         sys.modules.setdefault(mod.__name__, mod)
     for name, mod in (
@@ -136,6 +147,7 @@ def _install_vllm_stubs(layer_types=None):
         ("vllm.model_executor.layers.quantization.base_config", qc),
         ("vllm.model_executor.utils", vllm_utils),
         ("vllm.model_executor.layers.fused_moe.config", fm_cfg),
+        ("vllm.model_executor.layers.vocab_parallel_embedding", vpe),
     ):
         sys.modules[name] = mod
     return dict(
@@ -144,6 +156,8 @@ def _install_vllm_stubs(layer_types=None):
         MergedColumnParallelLinear=MergedColumnParallelLinear,
         QKVParallelLinear=QKVParallelLinear,
         UnquantizedLinearMethod=UnquantizedLinearMethod,
+        VocabParallelEmbedding=VocabParallelEmbedding,
+        ParallelLMHead=ParallelLMHead,
         registered=registered,
     )
 
@@ -843,6 +857,170 @@ def warmup_tests(mod):
     print("coop-autotune warmup (shape dedup, bucket coverage) OK")
 
 
+def lm_head_tests(mod, stubs):
+    """EXL3 lm_head (ParallelLMHead): exact-prefix dispatch (embed_tokens
+    unmatchable), contiguous vocab-column shard geometry at TP1/TP2, padded
+    vocab refusal, process-time registry/log/count contracts, no LARGE_M
+    retention on the head, head_dtype refusal."""
+    HEAD = "language_model.lm_head"
+    ORG, IN = 512, 64
+
+    # ---- dispatch ------------------------------------------------------
+    cfg = _nr_config(mod, layers={HEAD: {"bits": 6}})
+    m = cfg.get_quant_method(stubs["ParallelLMHead"](), HEAD)
+    assert type(m).__name__ == "Exl3LinearMethod" and m.bits == 6, m
+    assert mod._DENSE_EXL3_MODULES[-1] == (HEAD, 6), "boot count must include the head"
+    # pack without the key: the head falls back to stock (no behaviour change)
+    stock = mod.Exl3Config(bits=4)
+    assert stock.get_quant_method(stubs["ParallelLMHead"](), HEAD) is None
+    # embed_tokens can never match: not a ParallelLMHead, even at the
+    # declared prefix
+    assert cfg.get_quant_method(stubs["VocabParallelEmbedding"](), HEAD) is None
+    assert cfg.get_quant_method(stubs["VocabParallelEmbedding"](),
+                                "language_model.model.embed_tokens") is None
+
+    # ---- vocab-parallel shard geometry (contiguous column block) -------
+    t, suh, svh, mk, msuffix = _pack(mod, 6, ORG, IN)
+    for tp in (1, 2):
+        vp = ORG // tp
+        layers = []
+        for rank in range(tp):
+            mm = mod.Exl3LinearMethod(cfg, HEAD, 6)
+            layer = stubs["ParallelLMHead"]()
+            layer.prefix = HEAD
+            layer.tp_rank = rank
+            layer.tp_size = tp
+            layer.org_vocab_size = ORG
+            mm.create_weights(layer, IN, [vp], IN, ORG,
+                              params_dtype=torch.bfloat16)
+            _load_all(mod, mm, layer,
+                      {(0, "trellis"): t, (0, "suh"): suh, (0, "svh"): svh,
+                       (0, "marker"): mk, (0, "marker_suffix"): msuffix}, [0])
+            layers.append(layer)
+        for rank, layer in enumerate(layers):
+            assert layer.trellis.shape == (IN // 16, vp // 16, 96)
+            assert torch.equal(
+                layer.trellis,
+                t[:, rank * vp // 16:(rank + 1) * vp // 16, :]), "trellis tile columns"
+            assert torch.equal(layer.svh, svh[rank * vp:(rank + 1) * vp]), "svh rows"
+            assert torch.equal(layer.suh[0], suh), "suh is a full copy on every rank"
+            assert int(layer.mul1[0, 0]) == mod.MUL1_MARKER_SIGNED_INT32
+            assert int(layer.mcg[0, 0]) == 0
+        assert torch.equal(torch.cat([l.trellis for l in layers], dim=1), t)
+        assert torch.equal(torch.cat([l.svh for l in layers]), svh)
+
+    # ---- padded vocab refuses (vLLM pads to 64; 154880 is aligned, so the
+    # served head has padded == org; anything else is a pack mismatch) -----
+    mm = mod.Exl3LinearMethod(cfg, HEAD, 6)
+    layer = stubs["ParallelLMHead"]()
+    layer.prefix = HEAD
+    layer.tp_rank = 0
+    layer.tp_size = 2
+    layer.org_vocab_size = ORG - 64
+    try:
+        mm.create_weights(layer, IN, [ORG // 2], IN, ORG,
+                          params_dtype=torch.bfloat16)
+    except ValueError as exc:
+        assert "padded vocab" in str(exc), exc
+    else:
+        raise AssertionError("padded != org vocab must refuse")
+
+    # ---- process: registry entry, per-module + summary lines, count, no
+    # LARGE_M retention on the head ---------------------------------------
+    class StubLin:
+        def __init__(self, suh, svh):
+            self.in_features, self.out_features = suh.numel(), svh.numel()
+            self.mcg, self.mul1 = False, True
+
+        def forward(self, x, params, out_dtype=torch.float16):
+            return torch.zeros(x.shape[0], self.out_features, dtype=torch.float16)
+
+    orig_make, orig_reg = mod.make_linear_exl3, mod._register_dense_exl3_op
+    mod.make_linear_exl3 = lambda trellis, suh, svh, mcg, mul1, out_dtype: StubLin(suh, svh)
+    mod._register_dense_exl3_op = lambda: None
+    mod._DENSE_EXL3_MODULES.clear()
+    mod._DENSE_EXL3_LAYERS.clear()
+    records = []
+
+    class _Cap(logging.Handler):
+        def emit(self, r):
+            records.append(r.getMessage())
+
+    log = logging.getLogger("exl3_dense_test")
+    cap = _Cap()
+    log.addHandler(cap)
+    log.setLevel(logging.INFO)
+    try:
+        # one dense module + the head: the summary must count both
+        dpre = "language_model.model.layers.1.mlp.down_proj"
+        cfg2 = _nr_config(mod, layers={dpre: {"bits": 6}, HEAD: {"bits": 6}})
+        dm = cfg2.get_quant_method(stubs["RowParallelLinear"](), dpre)
+        dl = _fake_layer(stubs["RowParallelLinear"], dpre, 0, 1, [64], 128)
+        dm.create_weights(dl, 128, [64], 128, 64, params_dtype=torch.bfloat16)
+        t2, suh2, svh2, mk2, msuf2 = _pack(mod, 6, 64, 128)
+        _load_all(mod, dm, dl,
+                  {(0, "trellis"): t2, (0, "suh"): suh2, (0, "svh"): svh2,
+                   (0, "marker"): mk2, (0, "marker_suffix"): msuf2}, [0])
+        hm = cfg2.get_quant_method(stubs["ParallelLMHead"](), HEAD)
+        hl = stubs["ParallelLMHead"]()
+        hl.prefix = HEAD
+        hl.tp_rank = 0
+        hl.tp_size = 1
+        hl.org_vocab_size = ORG
+        hm.create_weights(hl, IN, [ORG], IN, ORG, params_dtype=torch.bfloat16)
+        _load_all(mod, hm, hl,
+                  {(0, "trellis"): t, (0, "suh"): suh, (0, "svh"): svh,
+                   (0, "marker"): mk, (0, "marker_suffix"): msuffix}, [0])
+        os.environ["GLM53_KDA_BF16_LARGE_M"] = "1"
+        dm.process_weights_after_loading(dl)
+        hm.process_weights_after_loading(hl)
+    finally:
+        os.environ.pop("GLM53_KDA_BF16_LARGE_M", None)
+        log.removeHandler(cap)
+        mod.make_linear_exl3 = orig_make
+        mod._register_dense_exl3_op = orig_reg
+
+    assert not hasattr(hl, "glm53_bf16_lm_w16"), "LARGE_M must never retain the head"
+    assert not hasattr(dl, "glm53_bf16_lm_w16")
+    assert not hasattr(hl, "trellis"), "staging params must be deleted"
+    entry = mod._DENSE_EXL3_LAYERS[hl._exl3_dense_handle]
+    assert entry["output_sizes"] == [ORG] and len(entry["linears"]) == 1
+    assert entry["bf16_weight"] is None and entry["bf16_shards"] == []
+    assert ("[dense-exl3] %s active (K=6, vocab shard %d x %d, custom op)"
+            % (HEAD, ORG, IN)) in records, records
+    assert "[dense-exl3] 2 EXL3-dense modules loaded {'K6': 2}" in records, records
+
+    # ---- head_dtype != model dtype refuses at load, not first request ---
+    vc = sys.modules["vllm.config"]
+    orig_gc = vc.get_current_vllm_config
+    bad = orig_gc()
+    bad.model_config.head_dtype = torch.float32
+    bad.model_config.dtype = torch.bfloat16
+    vc.get_current_vllm_config = lambda: bad
+    mod._DENSE_EXL3_MODULES.clear()
+    mod._DENSE_EXL3_LAYERS.clear()
+    try:
+        hm2 = cfg.get_quant_method(stubs["ParallelLMHead"](), HEAD)
+        hl2 = stubs["ParallelLMHead"]()
+        hl2.prefix = HEAD
+        hl2.tp_rank = 0
+        hl2.tp_size = 1
+        hl2.org_vocab_size = ORG
+        hm2.create_weights(hl2, IN, [ORG], IN, ORG, params_dtype=torch.bfloat16)
+        _load_all(mod, hm2, hl2,
+                  {(0, "trellis"): t, (0, "suh"): suh, (0, "svh"): svh,
+                   (0, "marker"): mk, (0, "marker_suffix"): msuffix}, [0])
+        try:
+            hm2.process_weights_after_loading(hl2)
+        except RuntimeError as exc:
+            assert "head_dtype" in str(exc), exc
+        else:
+            raise AssertionError("fp32 head_dtype must refuse the EXL3 head")
+    finally:
+        vc.get_current_vllm_config = orig_gc
+    print("lm_head dispatch/shard-geometry/padding/process/count/retention/head_dtype OK")
+
+
 def main() -> int:
     stubs = _install_vllm_stubs()
     mod = _load_exl3()
@@ -852,6 +1030,7 @@ def main() -> int:
     dispatch_tests(mod, stubs)
     large_m_tests(mod)
     warmup_tests(mod)
+    lm_head_tests(mod, stubs)
     ablit_tests()
     print("dense-exl3 overlay CPU checks OK")
     return 0

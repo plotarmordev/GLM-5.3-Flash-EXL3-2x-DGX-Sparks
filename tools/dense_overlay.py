@@ -8,6 +8,8 @@
 #     of the Hub (local paths stand in for ranged HTTP responses)
 #   - resumable range reads: http_stream_to retries resume at the offset
 #     already written instead of restarting the range
+#   - --lm-head: also carry lm_head.{trellis,suh,svh,mul1} under the served
+#     key language_model.lm_head (shares the layer-tensor probe validator)
 """Build a dense-EXL3 overlay pack for GLM-5.3-Flash.
 
 The source pack (routed experts already EXL3, everything else BF16) is left untouched:
@@ -21,6 +23,8 @@ vllm-exl3 reads. No shard of the source pack is rewritten and nothing is quantiz
     dense_overlay.py --branch 2.05bpw --src <pack> --out <overlay> --verify
     # stack the MTP draft layer on an existing overlay pack (draft module prefixes are model.layers.N)
     dense_overlay.py --branch 2.05bpw --src <overlay> --out <overlay-mtp> --tag -mtp --skip-layers ""         --draft-layers 45 --draft-prefix-rewrite model.language_model.:model.
+    # also carry the EXL3 lm_head (served key language_model.lm_head; boots report 192 modules)
+    dense_overlay.py --branch 4.05bpw --src <pack> --out <overlay>         --prefix-rewrite model.language_model.:language_model.model. --lm-head
 """
 
 import argparse
@@ -209,18 +213,11 @@ def build_plan(args, local_idx, local_hdr, remote):
 
     layer_re = args.root + "layers."
     plan, fork_keys, problems = [], collections.OrderedDict(), []
-    for name, fn in sorted(local_idx["weight_map"].items()):
-        if not name.startswith(layer_re) or not name.endswith(".weight"):
-            continue
-        rest = name[len(layer_re):]
-        layer, suffix = rest.split(".", 1)
-        suffix = suffix[: -len(".weight")]
-        if int(layer) in args.skip_layers or suffix not in FORK:
-            continue
-        out_f, in_f = local_hdr[fn][1][name]["shape"]
-        base = name[: -len(".weight")]
-        src_suffix, block, nblocks = FUSED_SOURCE.get(suffix, (suffix, 0, 1))
-        src = layer_re + layer + "." + src_suffix
+
+    def probe(name, src, nblocks):
+        """Validate one replaced tensor against the remote quant; return
+        (k, parts, in_f, out_f, marker) or None with the problem recorded."""
+        out_f, in_f = local_hdr[local_idx["weight_map"][name]][1][name]["shape"]
         marker = next((m for m in MARKERS if rmap.get(src + "." + m)), None)
         parts = {}
         for part in ("trellis", "suh", "svh", marker):
@@ -229,18 +226,35 @@ def build_plan(args, local_idx, local_hdr, remote):
             fn_r, hlen, meta = rmeta(src + "." + part)
             if meta is None:
                 problems.append("missing remote tensor %s.%s" % (src, part))
-                break
+                return None
             parts[part] = (fn_r, hlen, meta)
         if len(parts) != 4:
             problems.append("remote %s lacks a codebook marker or a part" % src)
-            continue
+            return None
         tsh = parts["trellis"][2]["shape"]
         k = tsh[2] // 16
         want = [in_f // 16, out_f * nblocks // 16, 16 * k]
         if tsh != want or parts["suh"][2]["shape"] != [in_f] or parts["svh"][2]["shape"] != [out_f * nblocks]:
             problems.append("%s: remote shapes trellis=%s suh=%s svh=%s vs local [%d,%d]" % (
                 src, tsh, parts["suh"][2]["shape"], parts["svh"][2]["shape"], out_f, in_f))
+            return None
+        return k, {p: {"file": v[0], "hlen": v[1], "meta": v[2]} for p, v in parts.items()}, in_f, out_f, marker
+
+    for name, fn in sorted(local_idx["weight_map"].items()):
+        if not name.startswith(layer_re) or not name.endswith(".weight"):
             continue
+        rest = name[len(layer_re):]
+        layer, suffix = rest.split(".", 1)
+        suffix = suffix[: -len(".weight")]
+        if int(layer) in args.skip_layers or suffix not in FORK:
+            continue
+        base = name[: -len(".weight")]
+        src_suffix, block, nblocks = FUSED_SOURCE.get(suffix, (suffix, 0, 1))
+        src = layer_re + layer + "." + src_suffix
+        got = probe(name, src, nblocks)
+        if got is None:
+            continue
+        k, parts, in_f, out_f, marker = got
         fork_suffix, shard = FORK[suffix]
         key = layer_re + layer + "." + fork_suffix
         rewrite = args.draft_prefix_rewrite if int(layer) in args.draft_layers else args.prefix_rewrite
@@ -256,8 +270,26 @@ def build_plan(args, local_idx, local_hdr, remote):
         plan.append({
             "name": name, "base": base, "src": src, "block": block, "nblocks": nblocks,
             "k": k, "in": in_f, "out": out_f, "marker": marker,
-            "parts": {p: {"file": v[0], "hlen": v[1], "meta": v[2]} for p, v in parts.items()},
+            "parts": parts,
         })
+    if args.lm_head:
+        # turboderp ships lm_head K6 (mul1): carry it as one more overlay
+        # tensor set. The config key is the SERVED module path
+        # (language_model.lm_head in the vision-wrapped model) — the layer
+        # --prefix-rewrite does not apply to it.
+        name = "lm_head.weight"
+        if name not in local_idx["weight_map"]:
+            problems.append("--lm-head: source pack has no lm_head.weight")
+        else:
+            got = probe(name, "lm_head", 1)
+            if got is not None:
+                k, parts, in_f, out_f, marker = got
+                fork_keys["language_model.lm_head"] = {"bits": k}
+                plan.append({
+                    "name": name, "base": "lm_head", "src": "lm_head",
+                    "block": 0, "nblocks": 1, "k": k, "in": in_f, "out": out_f,
+                    "marker": marker, "parts": parts,
+                })
     return plan, fork_keys, problems
 
 
@@ -334,7 +366,8 @@ def summarize(plan, fork_keys, problems):
     hist = collections.Counter()
     total = 0
     for e in plan:
-        hist["%s K=%d" % (e["src"].split("layers.", 1)[1].split(".", 1)[1], e["k"])] += 1
+        label = e["src"].split("layers.", 1)[1].split(".", 1)[1] if "layers." in e["src"] else e["src"]
+        hist["%s K=%d" % (label, e["k"])] += 1
         total += sum(nbytes(p["meta"]) for p in e["parts"].values()) // e["nblocks"]
     log("PLAN tensors=%d output_files=1 download_bytes=%.2f GB fork_keys=%d" % (len(plan), total / 1e9, len(fork_keys)))
     for k, v in sorted(hist.items()):
@@ -399,6 +432,9 @@ def main():
     ap.add_argument("--draft-layers", default="", help="comma list of layers served by the MTP draft module")
     ap.add_argument("--draft-prefix-rewrite", default=None, help="OLD:NEW rewrite of config key prefixes for --draft-layers")
     ap.add_argument("--tag", default="", help="suffix for the overlay file name (stack a second overlay on an overlay pack)")
+    ap.add_argument("--lm-head", action="store_true",
+                    help="also carry lm_head.{trellis,suh,svh,mul1} (turboderp K6 mul1) under "
+                    "the served key language_model.lm_head")
     ap.add_argument("--cache", default=os.path.expanduser("~/.cache/dense_overlay"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
