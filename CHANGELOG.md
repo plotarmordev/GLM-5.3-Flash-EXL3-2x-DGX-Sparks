@@ -37,9 +37,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   parity with FP8 `dense,kda` (paired contrast +0.0012 nats,
   CI [−0.0005, +0.0029]; top-1 94.39 vs 94.04), decode faster on every
   probe (+2.9 to +10.7 %), KV pool +53 %, cold prefill −9.5 %
-  (−6.6 % with the large-M copy). Retention-set arm numbers land in the
-  README section after the phase-2 GPU runs. Known limits in the README
-  section (TP=2 only, ABLIT incompatible, the draft stays BF16). The
+  (−6.6 % with the large-M copy). Retention-set / lm_head / draft arm
+  numbers are in the README section; the full phase-2 gate results are in
+  `docs/dense-exl3-phase2-results.md`. Known limits in the README
+  EXL3 draft pack is staged). The
   stock-profile CUDA-graph boot hang (exllamav3 coop autotuner tuning a
   first-seen GEMM shape inside capture) is fixed by an eager
   shape-x-row-bucket autotune warmup at the end of weight load.
@@ -60,7 +61,7 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   `overlay/qwen3_dflash2.py`, `start.sh`): a draft snapshot whose
   `config.json` declares `quantization_config.quant_method=exl3` with a
   `non_routed_exl3` block is served through `Exl3LinearMethod` (q/o/mlp/
-  kernel_projection/fc at 5 bpw; k/v stay BF16 for the fused context-KV
+  kernel_projection/fc at 6 bpw; k/v stay BF16 for the fused context-KV
   precompute). `Exl3LinearMethod` accepts QKVParallelLinear's string shard
   ids (`q`/`k`/`v`); the draft's checkpoint-relative `model.layers.N`
   declarations are shifted to the runtime prefixes (offset by the target
@@ -81,7 +82,13 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   reconciles the global tp_size vLLM stamps on ReplicatedLinear (the
   draft's fc and conv kernel_projection are duplicated per rank, not
   sharded) so the full pack tensors load whole at draft TP=2. The BF16
-  draft path is byte-identical.
+  draft path is byte-identical. Measured (README table; gate details in
+  `docs/dense-exl3-phase2-results.md`): decode +2.8/+4.7/+1.3/+0.4 % vs
+  EH, KV +50–69 k, 200-prompt acceptance parity with the BF16 draft
+  (−0.02 pp, CI [−0.76, +0.72]), target logits unchanged (contrast
+  0.000000 CI ±0.0009); the pre-registered decode-path probe line is
+  missed by 0.19 pp at ±1.4 pp probe resolution — stated in the README
+  row, shipped as opt-in.
 
 - Vendored pack builders under `tools/`: `dense_overlay.py` builds the
   dense-EXL3 overlay pack (Apache-2.0, from vcruz305/vllm-exl3 @78e1727

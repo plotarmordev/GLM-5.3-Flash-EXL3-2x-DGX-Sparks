@@ -3,7 +3,7 @@
 
 Runs at every container start (GLM53_OVERLAY_ORDER) on both ranks and once
 at image build (right after patch_dflash2.py), so a fresh build and a
-patched-at-boot 927d6521 land the same bytes. Two actions:
+patched-at-boot pinned test image (sha256:927d6521…) land the same bytes. Two actions:
 
 1. Install the mounted overlay qwen3_dflash2.py (quant_config threading
    into DFlashGroupedConv, draft EXL3 boot line) over the image's baked

@@ -34,7 +34,7 @@ ROOT = HERE.parent
 PATCH_SRC = ROOT / "overlay" / "patch_dflash2_exl3.py"
 DFLASH2_SRC = ROOT / "overlay" / "qwen3_dflash2.py"
 FIXTURE = HERE / "fixtures" / "qwen3_dflash-927d6521.py.txt"
-# sha256 of the image's qwen3_dflash.py (sha256:927d6521…, post-overlay state
+# sha256 of the pinned test image's qwen3_dflash.py (image sha256:927d6521…, post-overlay state
 # as patch_dflash2.py leaves it). Drift here means the anchors must be
 # re-derived against the new image.
 FIXTURE_SHA256 = "40b3a4c7b8893fe92b9e291b566d763a2c6e29712f3a4d56d1a5b246d1815745"

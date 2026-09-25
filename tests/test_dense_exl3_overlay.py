@@ -677,7 +677,7 @@ def draft_replicated_tests(mod, stubs):
     per rank — output_partition_sizes reports the FULL output. At draft TP=2
     the loader must not column-shard the full pack tensors against a
     full-size destination (the GPU boot failure: dest (4096,) != loaded
-    (2048,)). Shapes come from the real pack header on MIDDLE
+    (2048,)). Shapes come from the real pack header
     (tests/fixtures/dflash2_exl3_5bpw_header.json)."""
     Exl3LinearMethod = mod.Exl3LinearMethod
     header = json.loads(

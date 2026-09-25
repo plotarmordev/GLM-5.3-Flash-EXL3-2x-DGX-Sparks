@@ -372,11 +372,11 @@ show `[dense-exl3] 191 EXL3-dense modules loaded` (192 when the pack also
 carries the EXL3 `lm_head`, below) — any other count means a pack/model
 mismatch (boots refuse loudly on that condition).
 
-With an EXL3 **DFlash2 draft** pack (q/o/mlp/kernel_projection/fc at 5 bpw,
+With an EXL3 **DFlash2 draft** pack (q/o/mlp/kernel_projection/fc at 6 bpw,
 k/v kept BF16 for the fused context-KV weight), stage the snapshot as
-`$HF_CACHE/hub/models--local--dflash2-exl3-5bpw/snapshots/<rev>` on both
+`$HF_CACHE/hub/models--local--dflash2-exl3-6bpw/snapshots/<rev>` on both
 nodes (the regular draft sync carries it) and select it with
-`DFLASH_MODEL=local/dflash2-exl3-5bpw` + `DFLASH_REVISION=<rev>`; the
+`DFLASH_MODEL=local/dflash2-exl3-6bpw` + `DFLASH_REVISION=<rev>`; the
 `DFLASH_MODEL_DIR=<in-container path>` override skips resolution, download
 and worker sync (operator stages both ranks). The draft declares
 checkpoint-relative `model.layers.N` prefixes; the serving layer shifts
@@ -433,7 +433,9 @@ with [MiaAI-Lab/exllamav3](https://github.com/MiaAI-Lab/exllamav3) pinned
 at `63b32f0` (MIT, v1.4.2 — DFlash2 is quantized uncalibrated, synthetic
 Hessian, no target-model forwards) and packages the servable snapshot the
 draft section above describes: q/o/gate/up/down, the dynconv
-`kernel_projection` and `fc` at **6.0 bpw** (`BITS=5.0` selects 5 bpw),
+`kernel_projection` and `fc` at **6.0 bpw** (`BITS=5.0` selects 5 bpw;
+6.0 is the default because the 5 bpw draft measured −3.5 pp code-probe
+acceptance against the BF16 draft while 6 bpw matched it exactly),
 `k_proj`/`v_proj` kept BF16 for the fused context-KV weight. The
 converter runs on one GPU inside the recipe image; packaging is CPU-only.
 Stage the output as `$HF_CACHE/hub/models--local--<name>/snapshots/<rev>`
@@ -442,19 +444,23 @@ Stage the output as `$HF_CACHE/hub/models--local--<name>/snapshots/<rev>`
 
 ### Measured (TP=2, 262k ctx, 2 seqs, MNBT 1024, util 0.83)
 
-Paired teacher-forced contrast vs the same-boot BF16 reference; the
-same-boot BF16 floor is mean dNLL 0.00006 / top-1 95.15%. E = the 4.05bpw
-pack, F = `GLM53_DENSE_FP8=dense,kda`:
+Measured at the owner's profile (TP=2, 262 k ctx, 2 seqs, MNBT 1024, util 0.83; two boots
+per arm unless noted; quality = teacher-forced contrast against a BF16 boot, 209 k positions per
+capture). Gate details: docs/dense-exl3-phase2-results.md.
 
-| metric | E | F (FP8 dense) |
-|---|---|---|
-| mean dNLL vs BF16 | 0.0021 [0.0001, 0.0042] | 0.0009 [−0.0004, 0.0021] |
-| paired contrast E−F | +0.0012 nats, CI [−0.0005, +0.0029] ("not worse" bound passes) | — |
-| top-1 | 94.39 % | 94.04 % |
-| KL20 p99 | 0.178 | 0.199 |
-| decode vs F | structured +5.2 %, prose +10.7 %, code +2.9 %, code@32k +6.7 % | — |
-| KV pool | 1,174,231 tokens (+53 % vs F) | 769,100 |
-| cold prefill vs F | 0.905 / 0.911 / 0.902 at 8k / 32k / 96k (−9.5 %) | 1.0 |
+| arm | vs | decode structured / prose / code / code@32k | cold prefill 8k / 32k / 96k | KV pool | quality (ΔNLL vs BF16; contrast) | draft acceptance |
+|---|---|---|---|---|---|---|
+| **E** dense EXL3 | F (FP8 dense) | +5.2 % / +10.7 % / +2.9 % / +6.7 % | 0.905 / 0.911 / 0.902 | 1.17 M (+53 %) | 0.0021 vs F 0.0009, E−F +0.0012 CI [−0.0005, +0.0029] | = F |
+| **EH** = E + EXL3 lm_head | E | +4.2 % / +0.2 % / +3.9 % / +4.1 % | 1.00 / 1.00 / 0.99 | +20–60 k | EH−E +0.0005 CI [−0.0001, +0.0011] | = E |
+| **EP** = E + prefill BF16 retention (default set, 3.76 GiB/rank) | F | ≥ F on every probe (1.05 / 0.98 / 1.00 / 1.00) | **0.964 / 0.964 / 0.961** (0.954–0.963 at 7 168-token chunks) | 812–841 k (≥ 0.98 × F, −25 % vs E) | EP−E +0.0002 CI [−0.0008, +0.0013] | — |
+| | E | 1.02 / 0.99 / 0.97 / 1.01 (paired boots) | +7 % | | | |
+| **EDB** = EH + EXL3 DFlash2 draft 6 bpw | EH | +2.8 % / +4.7 % / +1.3 % / +0.4 % (4 boots) | 0.99–1.01 | +50–69 k | target logits unchanged (contrast 0.000000 CI ±0.0009) | 200-prompt acceptance −0.02 pp CI [−0.76, +0.72] vs BF16 draft; decode-path probe top-1 92.4 % vs 93.6 % (3 vs 2 boots; probe resolution ±1.4 pp) — a literal miss of the pre-registered −1 pp line, stated, not hidden; 5 bpw measured −3.5 pp, hence 6.0 default |
+| **All defaults** = EH + draft + retention (1 boot) | F / E | 89.5 / 37.6 / 61.3 / 59.9 tok/s (≥ F everywhere; ≥ E on 3 of 4) | 0.96 × F | **964 k** (> BF16's 871 k) | as E | +0.8 pp vs EDB CI [0.0, +1.7]; probe 94.7 % |
+
+Cold-prefill ratios are tok/s vs the FP8 arm at the same chunking; the retention knob
+`GLM53_DENSE_EXL3_PREFILL_BF16=off` returns ~290 k KV tokens at −6 % prefill. DFlash acceptance
+figures are the 200-prompt spec-decode counter estimator (max_tokens 64), not the single code
+prompt, whose greedy path swings ±16 pp between boots of the same arm.
 
 `GLM53_DENSE_EXL3_PREFILL_BF16` retains a load-time BF16 copy for a selected
 set of dense-EXL3 module types — a comma list of `kda_in`, `kda_o`,
@@ -468,9 +474,8 @@ rows > 144 (exllamav3's own reconstruct boundary) as one `F.linear` in the
 activation dtype; rows ≤ 144 stay on the EXL3 custom op, so decode is
 untouched. Same logical weights; the cost is 2 bytes/weight per rank, logged
 per module and as one summary line at boot. `GLM53_KDA_BF16_LARGE_M=1`
-remains as a backward-compatible alias for `kda_in`. Measured prefill /
-KV-pool / decode / quality numbers per retention set are filled into the
-table above after the phase-2 GPU runs.
+remains as a backward-compatible alias for `kda_in`. Measured numbers for
+the default retention set are in the Measured table above (EP rows).
 
 With 7,168-token prefill chunks (same profile otherwise, speed only, two
 boots per arm) cold prefill is faster for every arm but the gap remains:
@@ -486,9 +491,9 @@ artifact of small chunks.
 
 - Cold prefill is ~10–12 % slower than FP8 dense;
   `GLM53_DENSE_EXL3_PREFILL_BF16` retention sets narrow the gap at a KV-pool
-  cost (measured numbers land in the Measured section after the phase-2
-  runs). Decode and KV headroom are the gains; prompt-heavy workloads may
-  prefer FP8 or BF16.
+  cost (default set: 0.954–0.964 × F prefill for −25 % KV vs E — EP row in
+  the Measured section). Decode and KV headroom are the gains;
+  prompt-heavy workloads may prefer FP8 or BF16.
 - exllamav3's cooperative autotuner must never see a new GEMM shape inside
   CUDA-graph capture (its stream sync deadlocks the boot; reproduced at the
   stock profile and root-caused with py-spy). The overlay tunes every
@@ -499,7 +504,8 @@ artifact of small chunks.
   `start-tp4.sh` refuses (not wired).
 - `ABLIT=1` is incompatible: the pack quantizes o_proj on every layer, and
   both sides refuse the combination.
-- The DFlash2 draft stays BF16. `lm_head` is BF16 unless the pack was built
+- The DFlash2 draft is EXL3 6 bpw when a draft pack is staged (above), BF16
+  otherwise. `lm_head` is BF16 unless the pack was built
   with `--lm-head`: then the head runs the same EXL3 custom op (K6 mul1,
   77,440-row vocab shard per rank at TP=2, padded==org asserted at load) and
   the draft's candidate step reads it through the shared head module —
@@ -1786,6 +1792,8 @@ retains that license and the parent's third-party notices. DFlash2 stays [CC BY-
   the version vendored). Dense quants from
   [turboderp/GLM-5.3-Flash-exl3](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3).
   The AGPL-3.0 Alexbob0/glm53-flash-vllm-upstream-sm121 was not used.
+- **DFlash2 draft quantization:** [MiaAI-Lab/exllamav3](https://github.com/MiaAI-Lab/exllamav3)
+  (MIT, v1.4.2) — the converter `tools/dflash2_exl3_quant.sh` pins at `63b32f0`.
 - **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
 - **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
