@@ -1769,6 +1769,31 @@ class Exl3Config(QuantizationConfig):
                 "prefixes do not match this model"
             )
 
+    def offset_draft_layer_prefixes(self, offset: int) -> None:
+        """[dense-exl3] Shift declared ``layers.N`` prefixes by a DFlash
+        draft's ``start_layer_id``.
+
+        The image builds draft layers under runtime prefixes offset by the
+        target's layer count (it keeps draft KV-cache layer names distinct
+        from the target's), while an EXL3 draft pack declares
+        checkpoint-relative indices (``model.layers.0`` …). Call once with
+        the offset before the draft's layers are constructed; a second call
+        on the same instance is a no-op. Non-layer keys (``model.fc``) are
+        untouched. BF16 drafts never call this (their quant config is None).
+        """
+        layers = self.non_routed_exl3.get("layers") or {}
+        if not offset or not layers or getattr(self, "_draft_prefix_offset", 0):
+            return
+        self.non_routed_exl3["layers"] = {
+            re.sub(
+                r"layers\.(\d+)\.",
+                lambda m: f"layers.{int(m.group(1)) + offset}.",
+                prefix,
+            ): layer_cfg
+            for prefix, layer_cfg in layers.items()
+        }
+        self._draft_prefix_offset = offset
+
     # [dense-exl3] --- non-routed lookups -------------------------------
     def _matches_non_routed_exl3(self, prefix: str) -> bool:
         return prefix in (self.non_routed_exl3.get("layers") or {})
@@ -2438,6 +2463,13 @@ def _dense_exl3_warmup_autotune(capture_sizes: list[int] | None = None) -> int:
     return count
 
 
+# vLLM's QKVParallelLinear stacked mapping passes string shard ids
+# ("q"/"k"/"v"); MergedColumnParallelLinear passes ints. The DFlash2 draft's
+# qkv_proj is the first QKVParallelLinear on this path (the target's
+# MLA/KDA linears never exercise string ids).
+_QKV_SHARD_IDS = {"q": 0, "k": 1, "v": 2}
+
+
 class Exl3LinearMethod(LinearMethodBase):
     """Non-routed (dense) EXL3 linear method for attention/MLP dense projections.
 
@@ -2485,6 +2517,25 @@ class Exl3LinearMethod(LinearMethodBase):
         self.tp_rank = int(getattr(layer, "tp_rank", 0) or 0)
         self.tp_size = int(getattr(layer, "tp_size", 1) or 1)
         self.replicated_shards = frozenset(getattr(layer, "replicated_shard_ids", ()) or ())
+        # vLLM's LinearBase stamps the GLOBAL tp_rank/tp_size even on
+        # ReplicatedLinear (disable_tp "take[s] no effect for replicated
+        # linear layers"): the weight is duplicated per rank, nothing is
+        # sliced, and output_partition_sizes already reports the FULL
+        # output — sum(output_sizes) == output_size. Loading such a layer
+        # with the world tp_size would column-shard the full checkpoint
+        # tensor against a full-size destination (the DFlash2 draft's fc
+        # and conv kernel_projection hit exactly this at draft TP=2:
+        # dest (4096,) vs loaded (2048,)). Reconcile to the replicated
+        # geometry, like vLLM's own replicated weight_loader. RowParallel
+        # also reports the full output but genuinely shards the input, so
+        # it is excluded; genuinely column-sharded layers partition the
+        # output (sum < output_size) and keep the world geometry.
+        if (
+            not self.is_row_parallel
+            and self.tp_size > 1
+            and sum(self.output_sizes) == output_size
+        ):
+            self.tp_rank, self.tp_size = 0, 1
         self.in_per_partition = input_size_per_partition
         # [dense-exl3] The ParallelLMHead is the only non-LinearBase layer
         # this method serves: vLLM shards it as one contiguous block of the
@@ -2559,7 +2610,18 @@ class Exl3LinearMethod(LinearMethodBase):
         loaded_weight: torch.Tensor,
         loaded_shard_id=None,
     ) -> None:
-        shard_idx = 0 if loaded_shard_id is None else int(loaded_shard_id)
+        if loaded_shard_id is None:
+            shard_idx = 0
+        elif isinstance(loaded_shard_id, str):
+            try:
+                shard_idx = _QKV_SHARD_IDS[loaded_shard_id]
+            except KeyError:
+                raise ValueError(
+                    f"unknown EXL3 shard id {loaded_shard_id!r} for "
+                    f"{self.prefix}"
+                ) from None
+        else:
+            shard_idx = int(loaded_shard_id)
         if shard_idx >= self.n_shards:
             raise ValueError(
                 f"shard_idx={shard_idx} out of range for n_shards={self.n_shards}"

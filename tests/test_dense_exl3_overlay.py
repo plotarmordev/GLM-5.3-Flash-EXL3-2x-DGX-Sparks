@@ -9,6 +9,7 @@ imports exllamav3 (marker checks raise before LinearEXL3 construction).
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -59,6 +60,9 @@ def _install_vllm_stubs(layer_types=None):
         pass
 
     class RowParallelLinear(LinearBase):
+        pass
+
+    class ReplicatedLinear(LinearBase):
         pass
 
     class MergedColumnParallelLinear(LinearBase):
@@ -153,6 +157,7 @@ def _install_vllm_stubs(layer_types=None):
     return dict(
         LinearBase=LinearBase,
         RowParallelLinear=RowParallelLinear,
+        ReplicatedLinear=ReplicatedLinear,
         MergedColumnParallelLinear=MergedColumnParallelLinear,
         QKVParallelLinear=QKVParallelLinear,
         UnquantizedLinearMethod=UnquantizedLinearMethod,
@@ -446,7 +451,7 @@ def geometry_tests(mod, stubs):
                 stubs["MergedColumnParallelLinear"],
                 "language_model.model.layers.1.mlp.gate_up_proj",
                 rank, tp, sizes, H)
-            m.create_weights(layer, H, sizes, H, DENSE_I, torch.bfloat16)
+            m.create_weights(layer, H, sizes, H, 2 * DENSE_I, torch.bfloat16)
             layers.append(layer)
             methods.append(m)
         gate_t, gate_suh, gate_svh, gate_mk, _gkind = _pack(mod, 5, DENSE_I, H, seed=30)
@@ -475,7 +480,7 @@ def geometry_tests(mod, stubs):
         stubs["MergedColumnParallelLinear"],
         "language_model.model.layers.5.mlp.shared_experts.gate_up_proj",
         0, 2, [SHARED_I // 2, SHARED_I // 2], H)
-    m.create_weights(layer, H, [SHARED_I // 2, SHARED_I // 2], H, SHARED_I, torch.bfloat16)
+    m.create_weights(layer, H, [SHARED_I // 2, SHARED_I // 2], H, 2 * SHARED_I, torch.bfloat16)
     full_t, _, _, mk, _ = _pack(mod, 6, SHARED_I, H, seed=40)
     p = layer.trellis
     p.weight_loader(p, full_t, 0)
@@ -486,7 +491,7 @@ def geometry_tests(mod, stubs):
         stubs["MergedColumnParallelLinear"],
         "language_model.model.layers.5.mlp.shared_experts.gate_up_proj",
         0, 3, [SHARED_I // 2, SHARED_I // 2], H)  # sizes moot; refusal at load
-    m3.create_weights(layer3, H, [SHARED_I // 2, SHARED_I // 2], H, SHARED_I, torch.bfloat16)
+    m3.create_weights(layer3, H, [SHARED_I // 2, SHARED_I // 2], H, 2 * SHARED_I, torch.bfloat16)
     try:
         layer3.trellis.weight_loader(layer3.trellis, full_t, 0)
     except ValueError as exc:
@@ -560,6 +565,246 @@ def geometry_tests(mod, stubs):
     else:
         raise AssertionError("wrong marker value must refuse")
     print("codebook marker validation OK")
+
+
+def draft_qkv_tests(mod, stubs):
+    """DFlash2 draft qkv_proj (the first QKVParallelLinear on the EXL3 path):
+    string shard ids "q"/"k"/"v" load exactly like ints 0/1/2, the bf16 k/v
+    tail stages exactly the rank's [k; v] rows (the tensor the image's fused
+    context-KV build consumes whole), and an unknown string id refuses."""
+    Exl3LinearMethod = mod.Exl3LinearMethod
+    H_D = 4096  # draft hidden
+    Q, KV = 4096, 1024  # full-width q rows / k rows (32 q / 8 kv heads x 128)
+    prefix = "model.layers.45.self_attn.qkv_proj"  # runtime prefix (offset)
+
+    def build(rank, tp, bf16=((1, 2))):
+        cfg = _nr_config(
+            mod, layers={prefix: {"bits": 5, "bf16_shards": list(bf16)}})
+        m = Exl3LinearMethod(cfg, prefix, bits=5)
+        layer = _fake_layer(
+            stubs["QKVParallelLinear"], prefix, rank, tp,
+            [Q // tp, KV // tp, KV // tp], H_D)
+        m.create_weights(layer, H_D, [Q // tp, KV // tp, KV // tp], H_D,
+                         Q + 2 * KV, torch.bfloat16)
+        return m, layer
+
+    qt, qsuh, qsvh, qmk, qkind = _pack(mod, 5, Q, H_D, seed=60)
+    g = torch.Generator().manual_seed(61)
+    k_full = torch.randn(KV, H_D, dtype=torch.bfloat16, generator=g)
+    v_full = torch.randn(KV, H_D, dtype=torch.bfloat16, generator=g)
+
+    for tp in (1, 2):
+        q, kv = Q // tp, KV // tp
+        staged = []
+        for sids in (["q", "k", "v"], [0, 1, 2]):
+            rank_layers = []
+            for rank in range(tp):
+                m, layer = build(rank, tp)
+                # q EXL3 + k/v bf16 tail: trellis covers only the q tiles,
+                # the staging weight holds exactly the k+v rows.
+                assert layer.trellis.shape == (H_D // 16, q // 16, 80)
+                assert layer.weight.shape == (2 * kv, H_D)
+                _load_all(mod, m, layer,
+                          {(0, "trellis"): qt, (0, "suh"): qsuh,
+                           (0, "svh"): qsvh, (0, "marker"): qmk,
+                           (0, "marker_suffix"): qkind,
+                           (1, "weight"): k_full, (2, "weight"): v_full},
+                          sids)
+                w = layer.weight
+                # The staged weight IS the rank's fused KV block: the exact
+                # bf16 rows the context-KV precompute must see (D6 prefill).
+                assert torch.equal(w[:kv], k_full[rank * kv:(rank + 1) * kv])
+                assert torch.equal(w[kv:], v_full[rank * kv:(rank + 1) * kv])
+                assert int(layer.mul1[0, 0]) == mod.MUL1_MARKER_SIGNED_INT32
+                assert int(layer.mul1[1, 0]) == 0
+                assert int(layer.mul1[2, 0]) == 0
+                rank_layers.append(layer)
+            staged.append(rank_layers)
+        # string ids and int ids stage byte-identical tensors. Only the q
+        # shard's suh/svh rows are live — the bf16 shards' suh/svh rows are
+        # dead staging (process_weights_after_loading never reads them).
+        for rank in range(tp):
+            for suffix in ("trellis", "weight", "mul1", "mcg"):
+                assert torch.equal(getattr(staged[0][rank], suffix),
+                                   getattr(staged[1][rank], suffix)), suffix
+            assert torch.equal(staged[0][rank].suh[0], staged[1][rank].suh[0])
+            assert torch.equal(staged[0][rank].svh[:q], staged[1][rank].svh[:q])
+        # trellis column tiles partition the full q trellis across ranks
+        for rank in range(tp):
+            cols = slice(rank * q // 16, (rank + 1) * q // 16)
+            assert torch.equal(staged[0][rank].trellis, qt[:, cols])
+
+    # all-EXL3 QKV (no bf16 tail) with string ids, loaded out of order
+    cfg = _nr_config(mod, layers={prefix: {"bits": 5}})
+    m = Exl3LinearMethod(cfg, prefix, bits=5)
+    layer = _fake_layer(stubs["QKVParallelLinear"], prefix, 0, 1,
+                        [Q, KV, KV], H_D)
+    m.create_weights(layer, H_D, [Q, KV, KV], H_D, Q + 2 * KV, torch.bfloat16)
+    assert layer.trellis.shape == (H_D // 16, (Q + 2 * KV) // 16, 80)
+    parts = {}
+    for i, rows in ((0, Q), (1, KV), (2, KV)):
+        t, suh, svh, mk, mkind = _pack(mod, 5, rows, H_D, seed=70 + i)
+        parts[i] = (t, suh, svh, mk, mkind)
+    for sid, i in (("v", 2), ("q", 0), ("k", 1)):  # deliberate disorder
+        t, suh, svh, mk, mkind = parts[i]
+        layer.trellis.weight_loader(layer.trellis, t, sid)
+        layer.suh.weight_loader(layer.suh, suh, sid)
+        layer.svh.weight_loader(layer.svh, svh, sid)
+        getattr(layer, mkind).weight_loader(getattr(layer, mkind), mk, sid)
+    assert torch.equal(layer.trellis[:, : Q // 16], parts[0][0])
+    assert torch.equal(layer.trellis[:, Q // 16:(Q + KV) // 16], parts[1][0])
+    assert torch.equal(layer.trellis[:, (Q + KV) // 16:], parts[2][0])
+    assert torch.equal(layer.svh[:Q], parts[0][2])
+    assert torch.equal(layer.svh[Q:Q + KV], parts[1][2])
+    assert torch.equal(layer.svh[Q + KV:], parts[2][2])
+
+    # unknown string ids refuse loudly
+    m, layer = build(0, 1)
+    try:
+        layer.trellis.weight_loader(layer.trellis, qt, "w")
+    except ValueError as exc:
+        assert "unknown EXL3 shard id" in str(exc) and "'w'" in str(exc), exc
+    else:
+        raise AssertionError("unknown string shard id must refuse")
+    print("draft qkv string shard ids + bf16 k/v staging (TP1/TP2) OK")
+
+
+
+def draft_replicated_tests(mod, stubs):
+    """The draft's fc and conv kernel_projection are ReplicatedLinear: vLLM's
+    LinearBase stamps the GLOBAL tp_rank/tp_size on them (disable_tp "take[s]
+    no effect for replicated linear layers") while the weight is duplicated
+    per rank — output_partition_sizes reports the FULL output. At draft TP=2
+    the loader must not column-shard the full pack tensors against a
+    full-size destination (the GPU boot failure: dest (4096,) != loaded
+    (2048,)). Shapes come from the real pack header on MIDDLE
+    (tests/fixtures/dflash2_exl3_5bpw_header.json)."""
+    Exl3LinearMethod = mod.Exl3LinearMethod
+    header = json.loads(
+        (HERE / "fixtures" / "dflash2_exl3_5bpw_header.json").read_text()
+    )
+    # The header pins the geometry this test exercises (pack drift fails here).
+    assert header["fc.svh"]["shape"] == [4096]
+    assert header["fc.suh"]["shape"] == [20480]
+    assert header["fc.trellis"]["shape"] == [20480 // 16, 4096 // 16, 80]
+    kp0 = "layers.0.attention_conv.kernel_projection"
+    assert header[f"{kp0}.svh"]["shape"] == [1024]
+    assert header[f"{kp0}.trellis"]["shape"] == [4096 // 16, 1024 // 16, 80]
+    # k/v stay full BF16 tensors (the fused context-KV staging contract).
+    assert header["layers.0.self_attn.k_proj.weight"]["shape"] == [1024, 4096]
+    assert header["layers.0.self_attn.v_proj.weight"]["shape"] == [1024, 4096]
+
+    for name, out_f, in_f in (
+        ("model.fc", 4096, 20480),
+        ("model.layers.45.attention_conv.kernel_projection", 1024, 4096),
+        ("model.layers.45.mlp_conv.kernel_projection", 1024, 4096),
+    ):
+        cfg = _nr_config(mod, layers={name: {"bits": 5}})
+        t, suh, svh, mk, mkind = _pack(mod, 5, out_f, in_f, seed=90)
+        for rank in (0, 1):
+            m = Exl3LinearMethod(cfg, name, bits=5)
+            # vLLM ReplicatedLinear at world TP2: global tp attrs, FULL
+            # output partition — exactly what create_weights must reconcile.
+            layer = _fake_layer(
+                stubs["ReplicatedLinear"], name, rank, 2, [out_f], in_f
+            )
+            m.create_weights(
+                layer, in_f, [out_f], in_f, out_f, torch.bfloat16
+            )
+            assert (m.tp_rank, m.tp_size) == (0, 1), name  # replicated
+            _load_all(mod, m, layer,
+                      {(0, "trellis"): t, (0, "suh"): suh, (0, "svh"): svh,
+                       (0, "marker"): mk, (0, "marker_suffix"): mkind},
+                      [None])
+            # the full pack tensors land whole on every rank, unsharded
+            assert torch.equal(layer.trellis, t), name
+            assert torch.equal(layer.svh, svh), name
+            assert torch.equal(layer.suh[0], suh), name
+
+    # A genuinely column-sharded layer keeps the world geometry: gate_up at
+    # TP2 partitions each proj to 6144/rank (sum 12288 < output_size 24576),
+    # and the pack ships the full-width per-proj tensors.
+    name = "model.layers.45.mlp.gate_up_proj"
+    cfg = _nr_config(mod, layers={name: {"bits": 5}})
+    gate = _pack(mod, 5, 12288, 4096, seed=91)
+    up = _pack(mod, 5, 12288, 4096, seed=92)
+    for rank in (0, 1):
+        m = Exl3LinearMethod(cfg, name, bits=5)
+        layer = _fake_layer(
+            stubs["MergedColumnParallelLinear"], name, rank, 2,
+            [6144, 6144], 4096)
+        m.create_weights(layer, 4096, [6144, 6144], 4096, 24576,
+                         torch.bfloat16)
+        assert (m.tp_rank, m.tp_size) == (rank, 2), name
+        _load_all(mod, m, layer,
+                  {(0, "trellis"): gate[0], (0, "suh"): gate[1],
+                   (0, "svh"): gate[2], (0, "marker"): gate[3],
+                   (0, "marker_suffix"): gate[4],
+                   (1, "trellis"): up[0], (1, "suh"): up[1],
+                   (1, "svh"): up[2], (1, "marker"): up[3],
+                   (1, "marker_suffix"): up[4]},
+                  [0, 1])
+        gcols = slice(rank * 6144 // 16, (rank + 1) * 6144 // 16)
+        assert torch.equal(layer.trellis[:, :6144 // 16], gate[0][:, gcols])
+        assert torch.equal(layer.trellis[:, 6144 // 16:], up[0][:, gcols])
+        rows = slice(rank * 6144, (rank + 1) * 6144)
+        assert torch.equal(layer.svh[:6144], gate[2][rows])
+        assert torch.equal(layer.svh[6144:], up[2][rows])
+    print("draft replicated layers (fc + conv kernel_projection, TP2) OK")
+
+
+def draft_prefix_offset_tests(mod, stubs):
+    """EXL3 draft packs declare checkpoint-relative "model.layers.N" keys;
+    the runtime builds draft layers offset by the target's layer count (45).
+    offset_draft_layer_prefixes shifts the declarations once, leaves
+    non-layer keys (model.fc) alone, and makes dispatch land on the runtime
+    prefixes."""
+    declared = {}
+    for i in range(5):
+        p = f"model.layers.{i}"
+        declared[f"{p}.self_attn.qkv_proj"] = {"bits": 5, "bf16_shards": [1, 2]}
+        declared[f"{p}.self_attn.o_proj"] = {"bits": 5}
+        declared[f"{p}.mlp.gate_up_proj"] = {"bits": 5}
+        declared[f"{p}.mlp.down_proj"] = {"bits": 5}
+        declared[f"{p}.attention_conv.kernel_projection"] = {"bits": 5}
+        declared[f"{p}.mlp_conv.kernel_projection"] = {"bits": 5}
+    declared["model.fc"] = {"bits": 5}
+    cfg = _nr_config(mod, layers=declared)
+    assert len(declared) == 31  # the served module count (gate/up merged)
+
+    cfg.offset_draft_layer_prefixes(45)
+    keys = set(cfg.non_routed_exl3["layers"])
+    assert len(keys) == 31
+    assert "model.fc" in keys  # non-layer key untouched
+    assert "model.layers.45.self_attn.qkv_proj" in keys
+    assert "model.layers.49.mlp_conv.kernel_projection" in keys
+    assert not any("model.layers.0." in k for k in keys)
+    # bf16_shards survive the shift
+    assert cfg._bf16_shards_for("model.layers.45.self_attn.qkv_proj") == [1, 2]
+    # dispatch lands on the shifted runtime prefix, misses the unshifted one
+    m = cfg.get_quant_method(stubs["QKVParallelLinear"](),
+                             "model.layers.45.self_attn.qkv_proj")
+    assert type(m).__name__ == "Exl3LinearMethod" and m.bits == 5
+    m = cfg.get_quant_method(stubs["QKVParallelLinear"](),
+                             "model.layers.0.self_attn.qkv_proj")
+    assert type(m).__name__ == "UnquantizedLinearMethod"
+    # idempotent on the same instance; a fresh instance shifts once
+    cfg.offset_draft_layer_prefixes(45)
+    assert set(cfg.non_routed_exl3["layers"]) == keys
+    cfg2 = _nr_config(mod, layers=dict(declared))
+    cfg2.offset_draft_layer_prefixes(0)  # no offset -> no shift
+    assert set(cfg2.non_routed_exl3["layers"]) == set(declared)
+    empty = _nr_config(mod, layers={})
+    empty.offset_draft_layer_prefixes(45)  # nothing declared -> no-op
+    # the declared-vs-built assert reads the shifted keys
+    mod._DENSE_EXL3_MODULES.clear()
+    try:
+        cfg._assert_non_routed_built()
+    except RuntimeError as exc:
+        assert "31/31" in str(exc) and "model.fc" in str(exc), exc
+    else:
+        raise AssertionError("unbuilt shifted declarations must refuse")
+    print("draft prefix offset (checkpoint-relative -> runtime) OK")
 
 
 def dispatch_tests(mod, stubs):
@@ -743,7 +988,7 @@ def prefill_bf16_tests(mod):
     layer_off = torch.nn.Module()
     m._retain_bf16_large_m(layer_off, linears, tail)
     assert not hasattr(layer_off, "glm53_bf16_lm_w")
-    # ---- retention never selects the lm_head -----------------------------
+    # ---- retention never selects the lm_head or draft modules -----------
     mod._DENSE_EXL3_PREFILL_BF16_RETAINED.clear()
     try:
         os.environ["GLM53_DENSE_EXL3_PREFILL_BF16"] = "all"
@@ -753,6 +998,19 @@ def prefill_bf16_tests(mod):
         hl = torch.nn.Module()
         hm._retain_bf16_large_m(hl, linears, tail)
         assert not hasattr(hl, "glm53_bf16_lm_w")
+        # EXL3 DFlash2 draft mlp: the runtime prefix has no "draft" marker
+        # and gate_up suffix-matches dense_gate_up (load-bearing: the type
+        # function alone would select it) — only the draft quant config's
+        # prefix-offset marker excludes it.
+        dpre = "model.layers.90.mlp.gate_up_proj"
+        assert mod._dense_exl3_prefill_bf16_type(
+            dpre, mod._dense_exl3_prefill_bf16_types()) == "dense_gate_up"
+        dcfg = _nr_config(mod, layers={"model.layers.45.mlp.gate_up_proj": {"bits": 5}})
+        dcfg.offset_draft_layer_prefixes(45)  # declarations shift to dpre
+        dm = mod.Exl3LinearMethod(dcfg, dpre, 5)
+        dl = torch.nn.Module()
+        dm._retain_bf16_large_m(dl, linears, tail)
+        assert not hasattr(dl, "glm53_bf16_lm_w")
     finally:
         os.environ.pop("GLM53_DENSE_EXL3_PREFILL_BF16", None)
     assert mod._DENSE_EXL3_PREFILL_BF16_RETAINED == []
@@ -1097,6 +1355,9 @@ def main() -> int:
     mod = _load_exl3()
     config_tests(mod)
     geometry_tests(mod, stubs)
+    draft_qkv_tests(mod, stubs)
+    draft_replicated_tests(mod, stubs)
+    draft_prefix_offset_tests(mod, stubs)
     forward_op_tests(mod)
     dispatch_tests(mod, stubs)
     prefill_bf16_tests(mod)

@@ -256,6 +256,8 @@ ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adapti
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
+DFLASH2_EXL3_PATCH_HOST="${DFLASH2_EXL3_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dflash2_exl3.py}"
+DFLASH2_MODEL_OVERLAY_HOST="${DFLASH2_MODEL_OVERLAY_HOST:-$SCRIPT_DIR/overlay/qwen3_dflash2.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
 # IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
@@ -843,6 +845,8 @@ validate_overlay_artifacts() {
         "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
+        "$DFLASH2_EXL3_PATCH_HOST|[dense-exl3-dflash2]|$main_guard"
+        "$DFLASH2_MODEL_OVERLAY_HOST|DFlash2Qwen3ForCausalLM|EntryClass = DFlash2Qwen3ForCausalLM"
     )
     local entry path rest tag tail last stock_last
     if [ "${#artifacts[@]}" -eq 0 ]; then
@@ -1057,6 +1061,23 @@ resolve_dflash_dir() {
     [ -f "$dir/config.json" ] || die "DFlash2 config.json missing in $dir"
     [ -f "$dir/model.safetensors" ] || die "DFlash2 model.safetensors missing in $dir"
     printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$DFLASH_CACHE_NAME" "$hash"
+}
+
+select_dflash_model_dir() {
+    # Operator escape hatch: a pre-set DFLASH_MODEL_DIR is an in-container
+    # path used as-is (e.g. a locally built EXL3 draft snapshot). It must
+    # resolve on BOTH ranks — the override skips the DFlash2 download check
+    # and the worker sync, so stage it under the synced HF cache or on the
+    # NFS share yourself. Default: the pinned HF-cache draft snapshot.
+    if [ "$SPEC_METHOD" != "dflash" ]; then
+        printf ''
+        return
+    fi
+    if [ -n "${DFLASH_MODEL_DIR:-}" ]; then
+        printf '%s' "$DFLASH_MODEL_DIR"
+        return
+    fi
+    resolve_dflash_dir
 }
 
 check_port_free() {
@@ -1627,6 +1648,7 @@ download_weights() {
 download_dflash() {
     [ "$SPEC_METHOD" = "dflash" ] || return 0
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping DFlash2 download check"; return; }
+    [ -n "${DFLASH_MODEL_DIR:-}" ] && { log "DFLASH_MODEL_DIR set — operator-staged draft, skipping download"; return; }
     local have=0 selected=""
     if [ -n "${DFLASH_REVISION:-}" ]; then
         selected="$DFLASH_PATH/snapshots/$DFLASH_REVISION"
@@ -1740,14 +1762,16 @@ sync_weights() {
     fi
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
     if [ "${NFS_SHARE:-0}" = "1" ]; then
-        if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_PATH" ]; then
+        if [ "$SPEC_METHOD" = "dflash" ] && [ -z "${DFLASH_MODEL_DIR:-}" ] && [ ! -d "$DFLASH_PATH" ]; then
             die "DFlash2 weights missing at $DFLASH_PATH"
         fi
         nfs_share_weights
         return
     fi
     sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights" "$MODEL_SNAPSHOT"
-    if [ "$SPEC_METHOD" = "dflash" ]; then
+    # With DFLASH_MODEL_DIR set the operator owns draft staging on both
+    # ranks; the HF-cache draft sync is skipped.
+    if [ "$SPEC_METHOD" = "dflash" ] && [ -z "${DFLASH_MODEL_DIR:-}" ]; then
         [ -d "$DFLASH_PATH" ] || die "DFlash2 weights missing at $DFLASH_PATH"
         sync_repo_to_worker "$DFLASH_PATH" "$DFLASH_CACHE_NAME" "DFlash2 draft" "$DFLASH_REVISION"
     fi
@@ -1779,6 +1803,10 @@ GLM53_OVERLAY_ORDER=(
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    # patch_dflash2_exl3.py installs the mounted qwen3_dflash2.py and anchors
+    # the image's qwen3_dflash.py — no shared anchors with any overlay here;
+    # inert for BF16 drafts.
+    patch_dflash2_exl3.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
     patch_cache_reset.py
@@ -2037,6 +2065,10 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    [ -f "$DFLASH2_EXL3_PATCH_HOST" ] || die "missing $DFLASH2_EXL3_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DFLASH2_EXL3_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dflash2_exl3.py"
+    [ -f "$DFLASH2_MODEL_OVERLAY_HOST" ] || die "missing $DFLASH2_MODEL_OVERLAY_HOST"
+    scp -q -o BatchMode=yes "$DFLASH2_MODEL_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-qwen3_dflash2.py"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
@@ -2236,6 +2268,8 @@ launch_cluster() {
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_dflash2_exl3.py:/opt/glm53/patch_dflash2_exl3.py:ro' \
+        -v '/tmp/glm53-qwen3_dflash2.py:/opt/glm53/qwen3_dflash2.py:ro' \
         -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
@@ -2279,6 +2313,8 @@ launch_cluster() {
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$DFLASH2_EXL3_PATCH_HOST:/opt/glm53/patch_dflash2_exl3.py:ro" \
+        -v "$DFLASH2_MODEL_OVERLAY_HOST:/opt/glm53/qwen3_dflash2.py:ro" \
         -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
@@ -2491,9 +2527,8 @@ start_unlocked() {
     write_inner_scripts
 
     MODEL_DIR="$(resolve_model_dir)"
-    DFLASH_MODEL_DIR=""
+    DFLASH_MODEL_DIR="$(select_dflash_model_dir)"
     if [ "$SPEC_METHOD" = "dflash" ]; then
-        DFLASH_MODEL_DIR="$(resolve_dflash_dir)"
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"

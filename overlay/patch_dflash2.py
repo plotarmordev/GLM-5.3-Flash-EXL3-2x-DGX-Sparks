@@ -86,6 +86,9 @@ def main() -> None:
         "            start_layer_id=target_layer_num,\n"
         "        )\n",
     )
+    # The EXL3 DFlash2 draft anchors (quant-prefix shift, fused context-KV)
+    # live in patch_dflash2_exl3.py: a runtime GLM53_OVERLAY_ORDER overlay so
+    # existing images pick them up at container start without a rebuild.
 
     registry = SITE / "model_executor/models/registry.py"
     replace_once(

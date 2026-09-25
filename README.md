@@ -372,6 +372,25 @@ show `[dense-exl3] 191 EXL3-dense modules loaded` (192 when the pack also
 carries the EXL3 `lm_head`, below) — any other count means a pack/model
 mismatch (boots refuse loudly on that condition).
 
+With an EXL3 **DFlash2 draft** pack (q/o/mlp/kernel_projection/fc at 5 bpw,
+k/v kept BF16 for the fused context-KV weight), stage the snapshot as
+`$HF_CACHE/hub/models--local--dflash2-exl3-5bpw/snapshots/<rev>` on both
+nodes (the regular draft sync carries it) and select it with
+`DFLASH_MODEL=local/dflash2-exl3-5bpw` + `DFLASH_REVISION=<rev>`; the
+`DFLASH_MODEL_DIR=<in-container path>` override skips resolution, download
+and worker sync (operator stages both ranks). The draft declares
+checkpoint-relative `model.layers.N` prefixes; the serving layer shifts
+them by the target's layer count at construction. Boot check: the log must
+show `[dense-exl3] draft: 31 EXL3 modules loaded` and the summary total
+grows by 31 (191/192 → 222/223). Replicated modules (the draft's fc and
+conv kernel_projection, and any future replicated target module) are not
+TP-sharded: their full pack tensors load whole on every rank.
+
+The serving-side edits apply at container start on both ranks (the
+host-mounted `patch_dflash2_exl3.py` runtime overlay, idempotent and
+fail-closed on image drift) — no image rebuild is needed; a fresh build
+bakes the same bytes.
+
 ### Building the overlay pack
 
 The overlay symlinks a TR3 snapshot and adds one safetensors of EXL3
@@ -406,6 +425,20 @@ GLM53_DENSE_EXL3=1
 GLM53_DENSE_FP8=off
 ABLIT=0
 ```
+
+### Building the DFlash2 EXL3 draft pack
+
+`tools/dflash2_exl3_quant.sh` quantizes `incoai/GLM-5.3-Flash-DFlash2`
+with [MiaAI-Lab/exllamav3](https://github.com/MiaAI-Lab/exllamav3) pinned
+at `63b32f0` (MIT, v1.4.2 — DFlash2 is quantized uncalibrated, synthetic
+Hessian, no target-model forwards) and packages the servable snapshot the
+draft section above describes: q/o/gate/up/down, the dynconv
+`kernel_projection` and `fc` at **6.0 bpw** (`BITS=5.0` selects 5 bpw),
+`k_proj`/`v_proj` kept BF16 for the fused context-KV weight. The
+converter runs on one GPU inside the recipe image; packaging is CPU-only.
+Stage the output as `$HF_CACHE/hub/models--local--<name>/snapshots/<rev>`
+(+ `refs/main`) on both nodes and select it with `DFLASH_MODEL=local/<name>`
++ `DFLASH_REVISION=<rev>` as above.
 
 ### Measured (TP=2, 262k ctx, 2 seqs, MNBT 1024, util 0.83)
 

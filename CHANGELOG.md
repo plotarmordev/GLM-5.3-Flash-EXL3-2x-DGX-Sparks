@@ -56,6 +56,43 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   head shape. Boot summary reads 192 modules with the key, 191 without;
   packs without the key see no behaviour change.
 
+- EXL3 DFlash2 draft serving (`overlay/exl3.py`, `overlay/patch_dflash2_exl3.py`,
+  `overlay/qwen3_dflash2.py`, `start.sh`): a draft snapshot whose
+  `config.json` declares `quantization_config.quant_method=exl3` with a
+  `non_routed_exl3` block is served through `Exl3LinearMethod` (q/o/mlp/
+  kernel_projection/fc at 5 bpw; k/v stay BF16 for the fused context-KV
+  precompute). `Exl3LinearMethod` accepts QKVParallelLinear's string shard
+  ids (`q`/`k`/`v`); the draft's checkpoint-relative `model.layers.N`
+  declarations are shifted to the runtime prefixes (offset by the target
+  layer count) at draft construction; `DFlashGroupedConv` threads
+  `quant_config` (hidden_projection stays BF16); the fused context-KV
+  weight is shape-guarded (full-BF16 layout slices q rows exactly as
+  before, EXL3 staging is used whole). Boot log gains
+  `[dense-exl3] draft: N EXL3 modules loaded` with staged bytes, plus the
+  declared-vs-built check for the draft. Launcher: select the staged local
+  snapshot via `DFLASH_MODEL=local/<name>` + `DFLASH_REVISION=<rev>` (syncs
+  to the worker like any draft), or override the resolved path with
+  `DFLASH_MODEL_DIR` (skips draft download check and worker sync; the
+  operator stages both ranks). The two in-image anchors and the
+  qwen3_dflash2.py install apply at container start on both ranks
+  (GLM53_OVERLAY_ORDER, host-mounted `patch_dflash2_exl3.py`, idempotent
+  and fail-closed) — no image rebuild required; the Dockerfile runs the
+  same patcher so a fresh build lands identical bytes. `create_weights`
+  reconciles the global tp_size vLLM stamps on ReplicatedLinear (the
+  draft's fc and conv kernel_projection are duplicated per rank, not
+  sharded) so the full pack tensors load whole at draft TP=2. The BF16
+  draft path is byte-identical.
+
+- Vendored pack builders under `tools/`: `dense_overlay.py` builds the
+  dense-EXL3 overlay pack (Apache-2.0, from vcruz305/vllm-exl3 @78e1727
+  with the local `--local-quant` / resumable-read / `--lm-head`
+  modifications; header credits retained), and `dflash2_exl3_quant.sh`
+  (+ `dflash2_exl3_convert.py` / `dflash2_exl3_package.py`) builds the
+  EXL3 DFlash2 draft snapshot with MiaAI-Lab/exllamav3 pinned at
+  `63b32f0` (MIT): k/v BF16 for the fused context-KV weight,
+  kernel_projection + fc in the budget, 6.0 bpw default, servable
+  snapshot packaged with the `non_routed_exl3` block.
+
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not
