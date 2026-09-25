@@ -365,7 +365,9 @@ terms — see the donor card before redistributing anything derived.
 (turboderp 4.05bpw overlay — attn K6, shared K6, dense MLP K5, mul1
 codebook; 191 modules / 315 replaced tensors on GLM-5.3-Flash) instead of
 BF16. Requires `GLM53_DENSE_FP8=off` and `ABLIT=0` (refused otherwise);
-`GLM53_KDA_BF16_LARGE_M=1` is supported (below). Boot check: the log must
+`GLM53_DENSE_EXL3_PREFILL_BF16` retention is supported (below;
+`GLM53_KDA_BF16_LARGE_M=1` remains a backward-compatible alias for
+`kda_in`). Boot check: the log must
 show `[dense-exl3] 191 EXL3-dense modules loaded` (192 when the pack also
 carries the EXL3 `lm_head`, below) — any other count means a pack/model
 mismatch (boots refuse loudly on that condition).
@@ -403,7 +405,6 @@ MODEL_REVISION=<rev>            # e.g. k6k5-4.05bpw
 GLM53_DENSE_EXL3=1
 GLM53_DENSE_FP8=off
 ABLIT=0
-GLM53_KDA_BF16_LARGE_M=1        # optional, see below
 ```
 
 ### Measured (TP=2, 262k ctx, 2 seqs, MNBT 1024, util 0.83)
@@ -422,11 +423,21 @@ pack, F = `GLM53_DENSE_FP8=dense,kda`:
 | KV pool | 1,174,231 tokens (+53 % vs F) | 769,100 |
 | cold prefill vs F | 0.905 / 0.911 / 0.902 at 8k / 32k / 96k (−9.5 %) | 1.0 |
 
-With `GLM53_KDA_BF16_LARGE_M=1` (load-time fp16 copy of the dequantized
-KDA in_proj q/k/v shards + the bf16 tail, serving M>512 prefill; ~3.3
-GiB/rank over 34 layers) cold prefill improves to 0.923 / 0.942 / 0.934
-(−6.6 %) and the KV pool settles at 915,337 tokens (+19 % vs F); quality
-is unchanged (same logical weights; the pooled mean dNLL measured 0.0007).
+`GLM53_DENSE_EXL3_PREFILL_BF16` retains a load-time BF16 copy for a selected
+set of dense-EXL3 module types — a comma list of `kda_in`, `kda_o`,
+`mla_qkv_a`, `mla_q_b`, `mla_o`, `shared_gate_up`, `shared_down`,
+`dense_gate_up`, `dense_down` (or `all`; unset default with
+`GLM53_DENSE_EXL3=1` is `kda_in,shared_down,mla_qkv_a`, otherwise `off`;
+explicitly empty is rejected). Each selected
+module reconstructs every EXL3 shard once (`get_weight_tensor`, hadamards
+pre-applied), pre-concatenates the rows with any bf16 tail rows, and serves
+rows > 144 (exllamav3's own reconstruct boundary) as one `F.linear` in the
+activation dtype; rows ≤ 144 stay on the EXL3 custom op, so decode is
+untouched. Same logical weights; the cost is 2 bytes/weight per rank, logged
+per module and as one summary line at boot. `GLM53_KDA_BF16_LARGE_M=1`
+remains as a backward-compatible alias for `kda_in`. Measured prefill /
+KV-pool / decode / quality numbers per retention set are filled into the
+table above after the phase-2 GPU runs.
 
 With 7,168-token prefill chunks (same profile otherwise, speed only, two
 boots per arm) cold prefill is faster for every arm but the gap remains:
@@ -440,9 +451,11 @@ artifact of small chunks.
 
 ### Known limits
 
-- Cold prefill is ~10–12 % slower than FP8 dense (6.6 % with
-  `GLM53_KDA_BF16_LARGE_M=1` at MNBT 1024). Decode and KV headroom are the
-  gains; prompt-heavy workloads may prefer FP8 or BF16.
+- Cold prefill is ~10–12 % slower than FP8 dense;
+  `GLM53_DENSE_EXL3_PREFILL_BF16` retention sets narrow the gap at a KV-pool
+  cost (measured numbers land in the Measured section after the phase-2
+  runs). Decode and KV headroom are the gains; prompt-heavy workloads may
+  prefer FP8 or BF16.
 - exllamav3's cooperative autotuner must never see a new GEMM shape inside
   CUDA-graph capture (its stream sync deadlocks the boot; reproduced at the
   stock profile and root-caused with py-spy). The overlay tunes every
@@ -1465,7 +1478,8 @@ that are now documented/enforced:
 | `GLM53_ADAPTIVE_K` | `off` | `ema` = adaptive verification length (prose +13–21 %); needs the capture-size list in `EXTRA_ARGS`. See *Faster prose decode* |
 | `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1 |
 | `GLM53_DENSE_FP8` | `off` | `dense,kda` = FP8 weight-only (Marlin) dense projections, ~-11 ms/step; PROVISIONAL numerics. Groups: `shared,dense,kda,mla` |
-| `GLM53_DENSE_EXL3` | `0` | `1` = serve a `non_routed_exl3` pack (dense/attn/shared linears EXL3, mul1 codebook); requires `GLM53_DENSE_FP8=off` and `ABLIT=0`; `GLM53_KDA_BF16_LARGE_M=1` supported (load-time EXL3→BF16 in_proj copy for M>512); TP=2 only |
+| `GLM53_DENSE_EXL3` | `0` | `1` = serve a `non_routed_exl3` pack (dense/attn/shared linears EXL3, mul1 codebook); requires `GLM53_DENSE_FP8=off` and `ABLIT=0`; TP=2 only |
+| `GLM53_DENSE_EXL3_PREFILL_BF16` | `kda_in,shared_down,mla_qkv_a` with `GLM53_DENSE_EXL3=1`, else `off` | comma list of dense-EXL3 module types (`kda_in,kda_o,mla_qkv_a,mla_q_b,mla_o,shared_gate_up,shared_down,dense_gate_up,dense_down`) or `all`: keep a load-time BF16 copy (EXL3 shards reconstructed once, pre-concatenated with any bf16 tail) and serve rows > 144 prefill as one BF16 GEMM; rows ≤ 144 stay on the EXL3 custom op. Same logical weights; 2 B/weight per rank. Unset-only default: an explicitly empty value is rejected. `GLM53_KDA_BF16_LARGE_M=1` aliases `kda_in`. See *Dense EXL3* |
 | `ABLIT_METHOD` | `auto` | `auto` = transplant when `ablit/transplant/` is populated, else `proj` |
 | `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
 | `ABLIT_DIRECTION` | `dealign` | proj-only: `dealign` \| `bf_oproj` \| path to a custom `.pt` |

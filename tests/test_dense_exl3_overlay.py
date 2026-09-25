@@ -565,7 +565,8 @@ def geometry_tests(mod, stubs):
 def dispatch_tests(mod, stubs):
     Exl3Config = mod.Exl3Config
     def set_env(**kw):
-        for k in ("GLM53_DENSE_FP8", "GLM53_KDA_BF16_LARGE_M"):
+        for k in ("GLM53_DENSE_FP8", "GLM53_KDA_BF16_LARGE_M",
+                  "GLM53_DENSE_EXL3_PREFILL_BF16"):
             os.environ.pop(k, None)
         os.environ.update(kw)
 
@@ -611,19 +612,73 @@ def dispatch_tests(mod, stubs):
                                  "language_model.model.layers.1.self_attn.o_proj")
         assert type(m).__name__ == "UnquantizedLinearMethod", m
     finally:
-        for k in ("GLM53_DENSE_FP8", "GLM53_KDA_BF16_LARGE_M"):
+        for k in ("GLM53_DENSE_FP8", "GLM53_KDA_BF16_LARGE_M",
+                  "GLM53_DENSE_EXL3_PREFILL_BF16"):
             os.environ.pop(k, None)
     print("get_quant_method dispatch + conflict refusals OK")
 
 
 
-def large_m_tests(mod):
-    """GLM53_KDA_BF16_LARGE_M on the EXL3 KDA in_proj: retention keeps the
-    dequantized q/k/v rows fp16 and the bf16 tail separate; the M>512 apply
-    runs the custom op's exact arithmetic (fp16 GEMM -> x.dtype, then the
-    bf16 tail GEMM), so its output equals the custom-op output bitwise on
-    stub shards; M<=512 falls through to the custom op."""
+def prefill_bf16_tests(mod):
+    """GLM53_DENSE_EXL3_PREFILL_BF16 on dense-EXL3 modules: selection
+    parsing/validation, per-type module selection (kda/mla o_proj split by
+    layer_types), the retained BF16 weight equals the concat of
+    get_weight_tensor().t() + the bf16 tail bitwise on stub shards, and
+    apply routes rows > 144 to the copy (one F.linear in x.dtype) and
+    rows <= 144 to the custom op."""
 
+    # ---- selection parsing/validation ------------------------------------
+    def types_for(**env):
+        for k in ("GLM53_DENSE_EXL3_PREFILL_BF16", "GLM53_KDA_BF16_LARGE_M"):
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        try:
+            return mod._dense_exl3_prefill_bf16_types()
+        finally:
+            for k in ("GLM53_DENSE_EXL3_PREFILL_BF16", "GLM53_KDA_BF16_LARGE_M"):
+                os.environ.pop(k, None)
+
+    assert types_for() == set()
+    assert types_for(GLM53_DENSE_EXL3_PREFILL_BF16="off") == set()
+    assert types_for(GLM53_DENSE_EXL3_PREFILL_BF16="all") == \
+        set(mod._DENSE_EXL3_PREFILL_BF16_SUFFIXES)
+    assert types_for(GLM53_DENSE_EXL3_PREFILL_BF16="kda_in,shared_down,mla_qkv_a") == \
+        {"kda_in", "shared_down", "mla_qkv_a"}
+    assert types_for(GLM53_DENSE_EXL3_PREFILL_BF16=" KDA_IN , mla_o ") == {"kda_in", "mla_o"}
+    # backward compatible: the phase-1 in_proj knob selects kda_in
+    assert types_for(GLM53_KDA_BF16_LARGE_M="1") == {"kda_in"}
+    assert types_for(GLM53_DENSE_EXL3_PREFILL_BF16="mla_o",
+                     GLM53_KDA_BF16_LARGE_M="1") == {"mla_o", "kda_in"}
+    for bad in ("kda", "kda-in", "all,kda_in", "foo"):
+        try:
+            types_for(GLM53_DENSE_EXL3_PREFILL_BF16=bad)
+        except ValueError as exc:
+            assert "GLM53_DENSE_EXL3_PREFILL_BF16" in str(exc), exc
+        else:
+            raise AssertionError(f"{bad!r} must be rejected")
+
+    # ---- per-type module selection ----------------------------------------
+    f = mod._dense_exl3_prefill_bf16_type
+    lt = LAYER_TYPES  # layer 0 KDA (linear_attention), layer 3 MLA
+    kda = "language_model.model.layers.0.self_attn"
+    mla = "language_model.model.layers.3.self_attn"
+    assert f(f"{kda}.in_proj_qkvbfg_a", {"kda_in"}, lt) == "kda_in"
+    assert f(f"{kda}.o_proj", {"kda_o"}, lt) == "kda_o"
+    assert f(f"{mla}.o_proj", {"kda_o"}, lt) is None
+    assert f(f"{mla}.o_proj", {"mla_o"}, lt) == "mla_o"
+    assert f(f"{kda}.o_proj", {"mla_o"}, lt) is None
+    assert f(f"{mla}.fused_qkv_a_proj", {"mla_qkv_a"}, lt) == "mla_qkv_a"
+    assert f(f"{mla}.q_b_proj", {"mla_q_b"}, lt) == "mla_q_b"
+    p = "language_model.model.layers.0.mlp"
+    assert f(f"{p}.shared_experts.gate_up_proj", {"shared_gate_up"}, lt) == "shared_gate_up"
+    assert f(f"{p}.gate_up_proj", {"shared_gate_up"}, lt) is None
+    assert f(f"{p}.shared_experts.gate_up_proj", {"dense_gate_up"}, lt) is None
+    assert f(f"{p}.down_proj", {"dense_down"}, lt) == "dense_down"
+    assert f("language_model.model.layers.45.mtp.self_attn.o_proj",
+             {"kda_o", "mla_o"}, lt) is None
+    assert f(f"{kda}.o_proj", set(), lt) is None
+
+    # ---- retention: one bf16 pre-concat weight, bitwise on stub shards ----
     class ReconLinear:
         """Stub LinearEXL3: get_weight_tensor returns a known [k, out] fp16."""
 
@@ -663,53 +718,69 @@ def large_m_tests(mod):
     tail = torch.randn(sum(sizes[3:]), H, dtype=torch.bfloat16,
                        generator=torch.Generator().manual_seed(4))
 
+    mod._DENSE_EXL3_PREFILL_BF16_RETAINED.clear()
     layer = torch.nn.Module()
     try:
-        os.environ["GLM53_KDA_BF16_LARGE_M"] = "1"
+        os.environ["GLM53_DENSE_EXL3_PREFILL_BF16"] = "kda_in"
         m._retain_bf16_large_m(layer, linears, tail)
     finally:
-        os.environ.pop("GLM53_KDA_BF16_LARGE_M", None)
-    w16 = layer.glm53_bf16_lm_w16
-    assert w16.dtype == torch.float16 and w16.shape == (n_exl3, H)
-    assert layer.glm53_bf16_lm_tail is tail
-    assert layer.glm53_bf16_lm_min_m == mod.KDA_BF16_LARGE_M_MIN_M
+        os.environ.pop("GLM53_DENSE_EXL3_PREFILL_BF16", None)
+    w = layer.glm53_bf16_lm_w
+    assert w.dtype == torch.bfloat16 and w.shape == (n_local, H)
     assert layer.glm53_bf16_lm_n == n_local and layer.glm53_bf16_lm_k == H
-    # rows are the recon transposes, kept fp16 (no bf16 cast)
+    assert layer.glm53_bf16_lm_min_m == mod.DENSE_EXL3_PREFILL_BF16_MIN_M == 144
+    # EXL3 rows are the recon transposes, cast once to bf16; the tail rows
+    # follow in shard order, unmodified.
     off = 0
     for i in range(3):
-        assert torch.equal(w16[off:off + sizes[i]], linears[i].w.t())
+        assert torch.equal(w[off:off + sizes[i]],
+                           linears[i].w.t().to(torch.bfloat16))
         off += sizes[i]
+    assert torch.equal(w[n_exl3:], tail)
+    assert mod._DENSE_EXL3_PREFILL_BF16_RETAINED == [
+        (m.prefix, "kda_in", n_local * H * 2)]
+    # not selected -> nothing retained (default off is unchanged behaviour)
+    layer_off = torch.nn.Module()
+    m._retain_bf16_large_m(layer_off, linears, tail)
+    assert not hasattr(layer_off, "glm53_bf16_lm_w")
+    # ---- retention never selects the lm_head -----------------------------
+    mod._DENSE_EXL3_PREFILL_BF16_RETAINED.clear()
+    try:
+        os.environ["GLM53_DENSE_EXL3_PREFILL_BF16"] = "all"
+        # EXL3 lm_head (vocab head): guarded out before any suffix match.
+        hm = mod.Exl3LinearMethod(cfg, "language_model.lm_head", 6)
+        hm.is_vocab_head = True
+        hl = torch.nn.Module()
+        hm._retain_bf16_large_m(hl, linears, tail)
+        assert not hasattr(hl, "glm53_bf16_lm_w")
+    finally:
+        os.environ.pop("GLM53_DENSE_EXL3_PREFILL_BF16", None)
+    assert mod._DENSE_EXL3_PREFILL_BF16_RETAINED == []
 
-    # M>512: apply() must equal the custom-op output bitwise. Build the
-    # op entry over the same stub shards + tail, then compare.
+
+    # ---- routing: rows > 144 hit the copy, rows <= 144 the custom op ------
     mod._DENSE_EXL3_LAYERS.append(
         {"linears": list(linears), "bf16_shards": [3, 4, 5],
          "output_sizes": list(sizes), "bf16_weight": tail})
     layer._exl3_dense_handle = len(mod._DENSE_EXL3_LAYERS) - 1
-    x = torch.randn(600, H, dtype=torch.bfloat16)
-    y_apply = m.apply(layer, x)
-    y_op = mod._dense_exl3_forward_impl(x.reshape(-1, H), layer._exl3_dense_handle)
-    assert y_apply.dtype == torch.bfloat16 and y_apply.shape == (600, n_local)
-    assert torch.equal(y_apply, y_op), "large-M apply must match the custom op bitwise"
-    # and the parts equal the two GEMMs directly
-    assert torch.equal(y_apply[:, :n_exl3],
-                       torch.nn.functional.linear(x.half(), w16).to(torch.bfloat16))
-    assert torch.equal(y_apply[:, n_exl3:],
-                       torch.nn.functional.linear(x, tail))
-
-    # M<=512 falls through to the custom op: unregisterable here, so prove
-    # the branch was not taken via the stats counter.
+    x = torch.randn(200, H, dtype=torch.bfloat16)
+    y = m.apply(layer, x)
+    assert y.dtype == torch.bfloat16 and y.shape == (200, n_local)
+    assert torch.equal(y, torch.nn.functional.linear(x, w)), \
+        "rows>144 must be one F.linear against the retained bf16 copy"
+    # rows <= 144 falls through to the custom op: unregisterable here, so
+    # prove the branch was not taken via the stats counter.
     stats0 = mod.kda_large_m_dispatch_stats()["bf16_calls"]
-    x_lo = torch.randn(8, H, dtype=torch.bfloat16)
+    x_lo = torch.randn(144, H, dtype=torch.bfloat16)
     try:
         m.apply(layer, x_lo)
     except Exception as exc:  # noqa: BLE001  (torch.ops lookup on CPU)
         assert "dense_exl3_forward" in repr(exc), exc
     else:
-        raise AssertionError("M<=512 must fall through to the custom op")
+        raise AssertionError("rows<=144 must fall through to the custom op")
     assert mod.kda_large_m_dispatch_stats()["bf16_calls"] == stats0, \
-        "M<=512 must not take the large-M branch"
-    print("kda bf16-large-m on EXL3 (fp16 rows + bf16 tail, bitwise apply) OK")
+        "rows<=144 must not take the retained-copy branch"
+    print("dense-exl3 prefill-bf16 (parsing, selection, bitwise copy, M routing) OK")
 
 
 def ablit_tests():
@@ -980,8 +1051,8 @@ def lm_head_tests(mod, stubs):
         mod.make_linear_exl3 = orig_make
         mod._register_dense_exl3_op = orig_reg
 
-    assert not hasattr(hl, "glm53_bf16_lm_w16"), "LARGE_M must never retain the head"
-    assert not hasattr(dl, "glm53_bf16_lm_w16")
+    assert not hasattr(hl, "glm53_bf16_lm_w"), "retention must never select the head"
+    assert not hasattr(dl, "glm53_bf16_lm_w")
     assert not hasattr(hl, "trellis"), "staging params must be deleted"
     entry = mod._DENSE_EXL3_LAYERS[hl._exl3_dense_handle]
     assert entry["output_sizes"] == [ORG] and len(entry["linears"]) == 1
@@ -1028,7 +1099,7 @@ def main() -> int:
     geometry_tests(mod, stubs)
     forward_op_tests(mod)
     dispatch_tests(mod, stubs)
-    large_m_tests(mod)
+    prefill_bf16_tests(mod)
     warmup_tests(mod)
     lm_head_tests(mod, stubs)
     ablit_tests()

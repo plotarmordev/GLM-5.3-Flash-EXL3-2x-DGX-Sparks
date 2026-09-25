@@ -2246,6 +2246,96 @@ _DENSE_EXL3_LAYERS: list = []
 _DENSE_EXL3_MODULES: list[tuple[str, int]] = []  # (prefix, bits) per method
 _dense_exl3_build_checked = False
 
+# [dense-exl3] prefill BF16 retention (GLM53_DENSE_EXL3_PREFILL_BF16) --------
+# Measured (per-shape microbench over the pack's real trellises): the dense
+# E-vs-F prefill gap is the activation passes around the EXL3 reconstruct
+# path (per-shard had_r_128 in/out, casts, cat), not the weight reconstruct.
+# A selected module therefore keeps a load-time BF16 copy — every EXL3
+# shard's get_weight_tensor() (hadamards pre-applied, i.e. exactly the
+# weight the reconstruct path multiplies by) concatenated with any bf16
+# tail rows in output_sizes order — and rows > 144 run ONE F.linear in
+# x.dtype: the same logical weights, byte-for-byte F's LARGE_M arithmetic.
+# Rows <= 144 stay on the EXL3 custom op (bitcoder), so decode is
+# untouched. Cost: 2 B/weight per rank, logged per module and as one boot
+# summary line.
+# Dispatch boundary: LinearEXL3's own AUTO_RECONSTRUCT_THRESHOLD (144;
+# above it forward switches to the reconstruct path). Deliberately a
+# separate constant from the FP8 path's KDA_BF16_LARGE_M_MIN_M (512): that
+# one is the measured Marlin crossover, this one is the EXL3 library's.
+DENSE_EXL3_PREFILL_BF16_MIN_M = 144
+# Module-type vocabulary (suffix match on the vLLM module path; kda/mla
+# o_proj disambiguated by layer_types like the FP8 groups).
+_DENSE_EXL3_PREFILL_BF16_SUFFIXES = {
+    "shared_gate_up": (".mlp.shared_experts.gate_up_proj",),
+    "shared_down": (".mlp.shared_experts.down_proj",),
+    "dense_gate_up": (".mlp.gate_up_proj",),
+    "dense_down": (".mlp.down_proj",),
+    "kda_in": (".self_attn.in_proj_qkvbfg_a",),
+    "kda_o": (".self_attn.o_proj",),
+    "mla_qkv_a": (".self_attn.fused_qkv_a_proj",),
+    "mla_q_b": (".self_attn.q_b_proj",),
+    "mla_o": (".self_attn.o_proj",),
+}
+# (prefix, module_type, bytes) per retained module, for the summary line.
+_DENSE_EXL3_PREFILL_BF16_RETAINED: list[tuple[str, str, int]] = []
+
+
+def _dense_exl3_prefill_bf16_types() -> set[str]:
+    """Module types selected by GLM53_DENSE_EXL3_PREFILL_BF16.
+
+    off | all | comma list of _DENSE_EXL3_PREFILL_BF16_SUFFIXES keys.
+    start.sh resolves and forwards the unset default
+    (kda_in,shared_down,mla_qkv_a with GLM53_DENSE_EXL3=1, else off);
+    this parser's own unset fallback is off. Backward compatible:
+    GLM53_KDA_BF16_LARGE_M=1 (the phase-1 in_proj knob) selects kda_in.
+    """
+    raw = os.environ.get("GLM53_DENSE_EXL3_PREFILL_BF16", "off").strip().lower()
+    if raw in ("", "off", "0", "no", "none"):
+        types: set[str] = set()
+    elif raw in ("all", "on", "1"):
+        types = set(_DENSE_EXL3_PREFILL_BF16_SUFFIXES)
+    else:
+        types = {t.strip() for t in raw.split(",") if t.strip()}
+        unknown = types - set(_DENSE_EXL3_PREFILL_BF16_SUFFIXES)
+        if unknown:
+            raise ValueError(
+                "GLM53_DENSE_EXL3_PREFILL_BF16: unknown module "
+                f"type(s) {sorted(unknown)}"
+            )
+    if kda_bf16_large_m_enabled():
+        types.add("kda_in")
+    return types
+
+
+def _dense_exl3_prefill_bf16_type(
+    prefix: str,
+    types: set[str],
+    layer_types: list[str] | None = None,
+) -> str | None:
+    """Module type of `prefix` (vLLM module path) if selected for retention."""
+    if not types:
+        return None
+    if ".mtp" in prefix or "visual" in prefix or "draft" in prefix:
+        return None
+    m = re.search(r"\.layers\.(\d+)\.", prefix)
+    layer_idx = int(m.group(1)) if m else None
+    for mtype in sorted(types):
+        if not any(prefix.endswith(s) for s in _DENSE_EXL3_PREFILL_BF16_SUFFIXES[mtype]):
+            continue
+        if mtype in ("dense_gate_up", "dense_down") and ".shared_experts." in prefix:
+            continue
+        if mtype in ("kda_in", "kda_o", "mla_o"):
+            # o_proj exists on KDA and MLA layers; in_proj only on KDA.
+            lt = _glm53_layer_types() if layer_types is None else layer_types
+            if lt is None or layer_idx is None or layer_idx >= len(lt):
+                continue
+            is_kda = lt[layer_idx] == "linear_attention"
+            if (mtype != "mla_o") != is_kda:
+                continue
+        return mtype
+    return None
+
+
 
 def _dense_exl3_forward_impl(x: torch.Tensor, handle: int) -> torch.Tensor:
     entry = _DENSE_EXL3_LAYERS[handle]
@@ -2668,6 +2758,20 @@ class Exl3LinearMethod(LinearMethodBase):
                 len(_DENSE_EXL3_LAYERS),
                 {f"K{k}": n for k, n in sorted(k_hist.items())},
             )
+            if _DENSE_EXL3_PREFILL_BF16_RETAINED:
+                by_type: dict[str, int] = {}
+                total_bytes = 0
+                for _, mtype, nbytes in _DENSE_EXL3_PREFILL_BF16_RETAINED:
+                    by_type[mtype] = by_type.get(mtype, 0) + 1
+                    total_bytes += nbytes
+                logger.info(
+                    "[dense-exl3] prefill-bf16 retention: %d modules %s, "
+                    "%.2f GiB/rank (M>%d)",
+                    len(_DENSE_EXL3_PREFILL_BF16_RETAINED),
+                    {t: n for t, n in sorted(by_type.items())},
+                    total_bytes / 2**30,
+                    DENSE_EXL3_PREFILL_BF16_MIN_M,
+                )
             from vllm.config import get_current_vllm_config
 
             comp = getattr(get_current_vllm_config(), "compilation_config", None)
@@ -2678,67 +2782,87 @@ class Exl3LinearMethod(LinearMethodBase):
     def _retain_bf16_large_m(
         self, layer: torch.nn.Module, linears: list, bf16_weight: torch.Tensor | None
     ) -> None:
-        """Load-time large-M copy of the EXL3 in_proj for
-        GLM53_KDA_BF16_LARGE_M.
+        """Load-time BF16 copy for the dense-EXL3 prefill path
+        (GLM53_DENSE_EXL3_PREFILL_BF16).
 
-        Same contract as the FP8 path's retention (M > 512 prefill from a
-        load-time copy, decode stays on the EXL3 custom op), but the EXL3
-        rows stay FP16 and the bf16 tail stays BF16 as two tensors: the
-        large-M GEMM then runs the exact arithmetic the custom op runs
-        (fp16 GEMM -> activation dtype for q/k/v, bf16 GEMM for b/f_a/g_a):
-        same logical weights as the reconstruct path, differing only in
-        accumulation order. TP2 cost:
-        12576x4096x2 B = 98.25 MiB/layer-rank (~3.26 GiB/rank, 34 layers)."""
-        if not kda_bf16_large_m_enabled():
+        One [sum(output_sizes) x K] BF16 tensor per selected module: every
+        EXL3 shard's get_weight_tensor() (hadamards pre-applied, so exactly
+        the weight the reconstruct path multiplies by) concatenated with
+        the bf16 tail rows in output_sizes order. Rows > 144 then run a
+        single F.linear in x.dtype — the same logical weights as the custom
+        op, differing only in the fp16->bf16 rounding of the reconstructed
+        rows and in accumulation order. Rows <= 144 stay on the EXL3 custom
+        op. Cost: 2 B/weight per rank per selected module (TP2 kda_in
+        12576x4096x2 B = 98.25 MiB/layer-rank, ~3.26 GiB/rank over 34
+        layers)."""
+        # Retention is target-model dense projections only: never the EXL3
+        # lm_head (a vocab-parallel head, not a dense projection) and never
+        # DFlash2 draft modules — their runtime prefixes carry no "draft"
+        # marker and an offset draft mlp suffix-matches dense_gate_up/down,
+        # so the draft quant config's prefix-offset marker is the guard.
+        if getattr(self, "is_vocab_head", False):
             return
-        if not self.prefix.endswith("self_attn.in_proj_qkvbfg_a"):
+        if getattr(self.quant_config, "_draft_prefix_offset", 0):
             return
-        w16 = torch.cat(
-            [lin.get_weight_tensor().t() for lin in linears if lin is not None],
-            dim=0,
-        )
-        tail = bf16_weight
-        n_exl3, k = w16.shape
+        mtype = _dense_exl3_prefill_bf16_type(
+            self.prefix, _dense_exl3_prefill_bf16_types())
+        if mtype is None:
+            return
+        # Concatenate in output_sizes order; the bf16 shards are a
+        # validated contiguous tail (create_weights), so their rows of the
+        # staged weight follow the EXL3 rows.
+        parts: list[torch.Tensor] = []
+        tail_row = 0
+        for i, lin in enumerate(linears):
+            if lin is not None:
+                parts.append(lin.get_weight_tensor().t().to(torch.bfloat16))
+            else:
+                rows = self.output_sizes[i]
+                if bf16_weight is None:
+                    raise RuntimeError(
+                        f"[dense-exl3] {self.prefix}: shard {i} is bf16 but "
+                        "no staged bf16 weight exists"
+                    )
+                parts.append(bf16_weight[tail_row : tail_row + rows])
+                tail_row += rows
+        w = torch.cat(parts, dim=0).contiguous()
+        n, k = w.shape
         if k != self.in_per_partition:
             raise RuntimeError(
-                f"kda bf16-large-m: reconstructed in_proj input dim {k} != "
-                f"per-partition {self.in_per_partition}"
+                f"[dense-exl3] prefill-bf16 {self.prefix}: reconstructed "
+                f"input dim {k} != per-partition {self.in_per_partition}"
             )
-        layer.glm53_bf16_lm_w16 = w16
-        layer.glm53_bf16_lm_tail = tail
-        layer.glm53_bf16_lm_n = n_exl3 + (tail.shape[0] if tail is not None else 0)
+        layer.glm53_bf16_lm_w = w
+        layer.glm53_bf16_lm_n = n
         layer.glm53_bf16_lm_k = k
-        layer.glm53_bf16_lm_min_m = KDA_BF16_LARGE_M_MIN_M
+        # Resolved once: capture and replay cannot disagree about the branch.
+        layer.glm53_bf16_lm_min_m = DENSE_EXL3_PREFILL_BF16_MIN_M
+        nbytes = w.numel() * w.element_size()
+        _DENSE_EXL3_PREFILL_BF16_RETAINED.append((self.prefix, mtype, nbytes))
         logger.info(
-            "kda bf16-large-m retained for %s: exl3 fp16 [%dx%d] + bf16 tail "
-            "[%dx%d] +%.1f MiB/rank (M>%d), source=exl3-reconstruct",
-            self.prefix, n_exl3, k, tail.shape[0] if tail is not None else 0, k,
-            (w16.numel() + (tail.numel() if tail is not None else 0)) * 2 / 2**20,
-            KDA_BF16_LARGE_M_MIN_M,
+            "[dense-exl3] prefill-bf16 retained %s: type=%s [%dx%d] "
+            "+%.1f MiB/rank (M>%d), dtype=bf16, source=exl3-reconstruct",
+            self.prefix, mtype, n, k, nbytes / 2**20,
+            DENSE_EXL3_PREFILL_BF16_MIN_M,
         )
 
     def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
         handle = getattr(layer, "_exl3_dense_handle", None)
         if handle is None:
             raise RuntimeError("EXL3 linear layers were not built after weight load")
-        # Hybrid dispatch, same boundary as the FP8 large-M path: M is tensor
-        # metadata (no host sync); the retained copy exists only when the KDA
-        # in_proj passed every load-time check. Per-capture-size CUDA graphs
-        # bake the branch taken at capture. The large-M GEMMs mirror the
-        # custom op's arithmetic exactly (fp16 for the EXL3 rows, activation
-        # dtype for the bf16 tail).
-        w16 = getattr(layer, "glm53_bf16_lm_w16", None)
-        if w16 is not None and bias is None and x.dim() >= 2:
+        # Hybrid dispatch: M is tensor metadata (no host sync); the retained
+        # copy exists only on selected modules. Per-capture-size CUDA graphs
+        # bake the branch taken at capture. Rows > 144: one BF16 GEMM in
+        # x.dtype — exactly F's LARGE_M arithmetic; rows <= 144: the custom
+        # op (bitcoder), unchanged.
+        w = getattr(layer, "glm53_bf16_lm_w", None)
+        if w is not None and bias is None and x.dim() >= 2:
             k = int(layer.glm53_bf16_lm_k)
             if int(x.shape[-1]) == k:
                 m = x.numel() // k
                 if m > int(layer.glm53_bf16_lm_min_m):
                     _kda_large_m_note("bf16", m)
-                    x2d = x.reshape(-1, k)
-                    y = F.linear(x2d.half(), w16).to(x.dtype)
-                    tail = getattr(layer, "glm53_bf16_lm_tail", None)
-                    if tail is not None:
-                        y = torch.cat([y, F.linear(x2d, tail)], dim=-1)
+                    y = F.linear(x.reshape(-1, k), w)
                     return y.reshape(x.shape[:-1] + (int(layer.glm53_bf16_lm_n),))
         y = torch.ops.vllm.dense_exl3_forward(x, handle)
         if bias is not None:

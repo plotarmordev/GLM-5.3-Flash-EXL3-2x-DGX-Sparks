@@ -19,16 +19,27 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   MLP K5, mul1 codebook; 191 modules). Per module mutually exclusive with
   `GLM53_DENSE_FP8` and with `ABLIT` — launchers refuse pre-stop, the
   overlay refuses at load; a `non_routed_exl3` pack with the flag off
-  refuses to boot; TP=2 only. `GLM53_KDA_BF16_LARGE_M=1` is supported on
-  the EXL3 KDA in_proj: a load-time fp16 copy of the dequantized q/k/v
-  shards + the bf16 tail serves M>512 prefill with the custom op's exact
-  arithmetic (decode stays on EXL3; ~3.3 GiB/rank). Measured at
+  refuses to boot; TP=2 only. `GLM53_DENSE_EXL3_PREFILL_BF16` (unset
+  default `kda_in,shared_down,mla_qkv_a` with `GLM53_DENSE_EXL3=1`,
+  otherwise `off`; explicitly empty rejected) retains a load-time BF16
+  copy for a selected set of dense-EXL3
+  module types (comma list of `kda_in`, `kda_o`, `mla_qkv_a`, `mla_q_b`,
+  `mla_o`, `shared_gate_up`, `shared_down`, `dense_gate_up`, `dense_down`,
+  or `all`): every EXL3 shard is reconstructed once
+  (`get_weight_tensor`, hadamards pre-applied) and pre-concatenated with
+  any bf16 tail rows, and rows > 144 (exllamav3's own reconstruct
+  boundary) run one `F.linear` in the activation dtype — the same logical
+  weights; rows ≤ 144 stay on the EXL3 custom op, so decode is untouched.
+  `GLM53_KDA_BF16_LARGE_M=1` is kept as a backward-compatible alias for
+  `kda_in`. Cost is 2 bytes/weight per rank, logged per module and as one
+  boot summary line. Measured at
   262k/2seqs/MNBT 1024/util 0.83 (README "Dense EXL3" section): quality at
   parity with FP8 `dense,kda` (paired contrast +0.0012 nats,
   CI [−0.0005, +0.0029]; top-1 94.39 vs 94.04), decode faster on every
   probe (+2.9 to +10.7 %), KV pool +53 %, cold prefill −9.5 %
-  (−6.6 % with the large-M copy). Known limits in the README section
-  (TP=2 only, ABLIT incompatible, the draft stays BF16). The
+  (−6.6 % with the large-M copy). Retention-set arm numbers land in the
+  README section after the phase-2 GPU runs. Known limits in the README
+  section (TP=2 only, ABLIT incompatible, the draft stays BF16). The
   stock-profile CUDA-graph boot hang (exllamav3 coop autotuner tuning a
   first-seen GEMM shape inside capture) is fixed by an eager
   shape-x-row-bucket autotune warmup at the end of weight load.

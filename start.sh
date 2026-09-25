@@ -421,10 +421,28 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # (see docs/kda-bf16-large-m.md); default off.
 GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
 # Dense-EXL3 for the non-routed linears (overlay/exl3.py [dense-exl3]; README
-# env table). Mutually exclusive with GLM53_DENSE_FP8 and ABLIT;
-# GLM53_KDA_BF16_LARGE_M=1 is supported (EXL3 in_proj reconstruct path);
-# TP=2 only.
+# env table). Mutually exclusive with GLM53_DENSE_FP8 and ABLIT; TP=2 only.
 GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}"
+# Prefill BF16 retention for dense-EXL3 modules (overlay/exl3.py [dense-exl3];
+# README "Dense EXL3" section). Comma list of module types: kda_in, kda_o,
+# mla_qkv_a, mla_q_b, mla_o, shared_gate_up, shared_down, dense_gate_up,
+# dense_down — or all / off. Each selected module keeps a load-time
+# BF16 copy (EXL3 shards reconstructed once, pre-concatenated with any bf16
+# tail rows) and serves rows > 144 prefill as one BF16 GEMM in the activation
+# dtype; rows <= 144 stay on the EXL3 custom op. Same logical weights; costs
+# 2 B/weight per rank. GLM53_KDA_BF16_LARGE_M=1 maps to kda_in (backward
+# compatible). TP=2 only like GLM53_DENSE_EXL3.
+# Default applies only when UNSET (same shape as LOAD_FORMAT above):
+# kda_in,shared_down,mla_qkv_a with GLM53_DENSE_EXL3=1, off otherwise. An
+# explicitly empty value is an operator error and validate_numeric_config
+# rejects it.
+if [ -z "${GLM53_DENSE_EXL3_PREFILL_BF16+x}" ]; then
+    if [ "$GLM53_DENSE_EXL3" = "1" ]; then
+        GLM53_DENSE_EXL3_PREFILL_BF16="kda_in,shared_down,mla_qkv_a"
+    else
+        GLM53_DENSE_EXL3_PREFILL_BF16="off"
+    fi
+fi
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
@@ -661,6 +679,30 @@ _glm53_validate_mixed_prefill() {
     fi
 }
 
+# overlay/exl3.py parses the same vocabulary at weight load (lowercased,
+# comma-separated); a typo must fail here, pre-stop, not after a stop.
+_glm53_validate_dense_exl3_prefill_bf16() {
+    local raw tok
+    # Unset inherits the configuration-block default; an explicitly empty
+    # value is an operator error, not off.
+    if [ -n "${GLM53_DENSE_EXL3_PREFILL_BF16+x}" ] && [ -z "$GLM53_DENSE_EXL3_PREFILL_BF16" ]; then
+        echo "GLM53_DENSE_EXL3_PREFILL_BF16: empty is not a value — unset it to inherit the default (kda_in,shared_down,mla_qkv_a with GLM53_DENSE_EXL3=1, else off) or set off/all/a comma list" >&2
+        return 2
+    fi
+    raw="$(printf '%s' "${GLM53_DENSE_EXL3_PREFILL_BF16:-off}" | tr '[:upper:]' '[:lower:]')"
+    local -a toks=( ${raw//,/ } )
+    case "${toks[*]-}" in
+        ""|off|0|no|none|all|on|1) return 0 ;;
+    esac
+    for tok in "${toks[@]}"; do
+        case "$tok" in
+            kda_in|kda_o|mla_qkv_a|mla_q_b|mla_o|shared_gate_up|shared_down|dense_gate_up|dense_down) ;;
+            *) echo "GLM53_DENSE_EXL3_PREFILL_BF16: unknown module type '$tok' (allowed: kda_in,kda_o,mla_qkv_a,mla_q_b,mla_o,shared_gate_up,shared_down,dense_gate_up,dense_down; or all/off)" >&2
+               return 2 ;;
+        esac
+    done
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -716,6 +758,7 @@ validate_numeric_config() {
             return 2
         fi
     fi
+    _glm53_validate_dense_exl3_prefill_bf16 || return
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
     _glm53_validate_spinwait_ms || return
@@ -2107,7 +2150,7 @@ launch_cluster() {
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
              GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M GLM53_DENSE_EXL3 \
-             GLM53_COOP_GEOMETRY; do
+             GLM53_DENSE_EXL3_PREFILL_BF16 GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2295,6 +2338,7 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
         -e GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}" \
+        -e GLM53_DENSE_EXL3_PREFILL_BF16="$GLM53_DENSE_EXL3_PREFILL_BF16" \
         -e GLM53_EXL3_MOE_FAST="$GLM53_EXL3_MOE_FAST" \
         -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
