@@ -256,6 +256,8 @@ ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adapti
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
+DFLASH2_EXL3_PATCH_HOST="${DFLASH2_EXL3_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dflash2_exl3.py}"
+DFLASH2_MODEL_OVERLAY_HOST="${DFLASH2_MODEL_OVERLAY_HOST:-$SCRIPT_DIR/overlay/qwen3_dflash2.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
 # IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
@@ -420,6 +422,29 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # TP=3 local shape [8726x4096] (64→66 head pad). Changes target numerics
 # (see docs/kda-bf16-large-m.md); default off.
 GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
+# Dense-EXL3 for the non-routed linears (overlay/exl3.py [dense-exl3]; README
+# env table). Mutually exclusive with GLM53_DENSE_FP8 and ABLIT; TP=2 only.
+GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}"
+# Prefill BF16 retention for dense-EXL3 modules (overlay/exl3.py [dense-exl3];
+# README "Dense EXL3" section). Comma list of module types: kda_in, kda_o,
+# mla_qkv_a, mla_q_b, mla_o, shared_gate_up, shared_down, dense_gate_up,
+# dense_down — or all / off. Each selected module keeps a load-time
+# BF16 copy (EXL3 shards reconstructed once, pre-concatenated with any bf16
+# tail rows) and serves rows > 144 prefill as one BF16 GEMM in the activation
+# dtype; rows <= 144 stay on the EXL3 custom op. Same logical weights; costs
+# 2 B/weight per rank. GLM53_KDA_BF16_LARGE_M=1 maps to kda_in (backward
+# compatible). TP=2 only like GLM53_DENSE_EXL3.
+# Default applies only when UNSET (same shape as LOAD_FORMAT above):
+# kda_in,shared_down,mla_qkv_a with GLM53_DENSE_EXL3=1, off otherwise. An
+# explicitly empty value is an operator error and validate_numeric_config
+# rejects it.
+if [ -z "${GLM53_DENSE_EXL3_PREFILL_BF16+x}" ]; then
+    if [ "$GLM53_DENSE_EXL3" = "1" ]; then
+        GLM53_DENSE_EXL3_PREFILL_BF16="kda_in,shared_down,mla_qkv_a"
+    else
+        GLM53_DENSE_EXL3_PREFILL_BF16="off"
+    fi
+fi
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
@@ -656,6 +681,30 @@ _glm53_validate_mixed_prefill() {
     fi
 }
 
+# overlay/exl3.py parses the same vocabulary at weight load (lowercased,
+# comma-separated); a typo must fail here, pre-stop, not after a stop.
+_glm53_validate_dense_exl3_prefill_bf16() {
+    local raw tok
+    # Unset inherits the configuration-block default; an explicitly empty
+    # value is an operator error, not off.
+    if [ -n "${GLM53_DENSE_EXL3_PREFILL_BF16+x}" ] && [ -z "$GLM53_DENSE_EXL3_PREFILL_BF16" ]; then
+        echo "GLM53_DENSE_EXL3_PREFILL_BF16: empty is not a value — unset it to inherit the default (kda_in,shared_down,mla_qkv_a with GLM53_DENSE_EXL3=1, else off) or set off/all/a comma list" >&2
+        return 2
+    fi
+    raw="$(printf '%s' "${GLM53_DENSE_EXL3_PREFILL_BF16:-off}" | tr '[:upper:]' '[:lower:]')"
+    local -a toks=( ${raw//,/ } )
+    case "${toks[*]-}" in
+        ""|off|0|no|none|all|on|1) return 0 ;;
+    esac
+    for tok in "${toks[@]}"; do
+        case "$tok" in
+            kda_in|kda_o|mla_qkv_a|mla_q_b|mla_o|shared_gate_up|shared_down|dense_gate_up|dense_down) ;;
+            *) echo "GLM53_DENSE_EXL3_PREFILL_BF16: unknown module type '$tok' (allowed: kda_in,kda_o,mla_qkv_a,mla_q_b,mla_o,shared_gate_up,shared_down,dense_gate_up,dense_down; or all/off)" >&2
+               return 2 ;;
+        esac
+    done
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -684,6 +733,34 @@ validate_numeric_config() {
         echo "GLM53_DRAFT_KV_COMPACT=1 requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
+    _glm53_validate_bool_flag GLM53_DENSE_EXL3 "${GLM53_DENSE_EXL3-0}" || return
+    # Dense EXL3 owns the same dense modules the FP8/BF16 overlays target and
+    # every o_proj; refuse the mix here (pre-stop) — overlay/exl3.py raises
+    # per module at load as the in-container backstop.
+    if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
+        case "${GLM53_DENSE_FP8:-off}" in
+            ""|off|0|no|none) ;;
+            *) echo "GLM53_DENSE_EXL3=1 requires GLM53_DENSE_FP8=off (got: ${GLM53_DENSE_FP8}) — the dense-EXL3 pack covers every FP8 group's modules" >&2
+               return 2 ;;
+        esac
+        if [ "${ABLIT-0}" = "1" ]; then
+            echo "GLM53_DENSE_EXL3=1 requires ABLIT=0 — a dense-EXL3 pack quantizes o_proj on every layer; ABLIT edits BF16 o_proj only" >&2
+            return 2
+        fi
+    else
+        # Pre-stop mirror of the in-container pack/flag refusal
+        # (overlay/patch_dense_fp8.py): a non_routed_exl3 pack must not boot
+        # with the flag off. Best-effort on the host snapshot; the container
+        # re-checks.
+        local _snap="${MODEL_SNAPSHOT:-}"
+        [ -n "$_snap" ] || { [ -f "$MODEL_PATH/refs/main" ] && _snap="$(<"$MODEL_PATH/refs/main")"; }
+        if [ -n "$_snap" ] && [ -f "$MODEL_PATH/snapshots/$_snap/config.json" ] \
+           && grep -q '"non_routed_exl3"' "$MODEL_PATH/snapshots/$_snap/config.json"; then
+            echo "GLM53_DENSE_EXL3=0 but the model pack carries non_routed_exl3 — set GLM53_DENSE_EXL3=1 or serve a non-dense pack" >&2
+            return 2
+        fi
+    fi
+    _glm53_validate_dense_exl3_prefill_bf16 || return
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
     _glm53_validate_spinwait_ms || return
@@ -768,6 +845,8 @@ validate_overlay_artifacts() {
         "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
+        "$DFLASH2_EXL3_PATCH_HOST|[dense-exl3-dflash2]|$main_guard"
+        "$DFLASH2_MODEL_OVERLAY_HOST|DFlash2Qwen3ForCausalLM|EntryClass = DFlash2Qwen3ForCausalLM"
     )
     local entry path rest tag tail last stock_last
     if [ "${#artifacts[@]}" -eq 0 ]; then
@@ -982,6 +1061,23 @@ resolve_dflash_dir() {
     [ -f "$dir/config.json" ] || die "DFlash2 config.json missing in $dir"
     [ -f "$dir/model.safetensors" ] || die "DFlash2 model.safetensors missing in $dir"
     printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$DFLASH_CACHE_NAME" "$hash"
+}
+
+select_dflash_model_dir() {
+    # Operator escape hatch: a pre-set DFLASH_MODEL_DIR is an in-container
+    # path used as-is (e.g. a locally built EXL3 draft snapshot). It must
+    # resolve on BOTH ranks — the override skips the DFlash2 download check
+    # and the worker sync, so stage it under the synced HF cache or on the
+    # NFS share yourself. Default: the pinned HF-cache draft snapshot.
+    if [ "$SPEC_METHOD" != "dflash" ]; then
+        printf ''
+        return
+    fi
+    if [ -n "${DFLASH_MODEL_DIR:-}" ]; then
+        printf '%s' "$DFLASH_MODEL_DIR"
+        return
+    fi
+    resolve_dflash_dir
 }
 
 check_port_free() {
@@ -1552,6 +1648,7 @@ download_weights() {
 download_dflash() {
     [ "$SPEC_METHOD" = "dflash" ] || return 0
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping DFlash2 download check"; return; }
+    [ -n "${DFLASH_MODEL_DIR:-}" ] && { log "DFLASH_MODEL_DIR set — operator-staged draft, skipping download"; return; }
     local have=0 selected=""
     if [ -n "${DFLASH_REVISION:-}" ]; then
         selected="$DFLASH_PATH/snapshots/$DFLASH_REVISION"
@@ -1665,14 +1762,16 @@ sync_weights() {
     fi
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
     if [ "${NFS_SHARE:-0}" = "1" ]; then
-        if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_PATH" ]; then
+        if [ "$SPEC_METHOD" = "dflash" ] && [ -z "${DFLASH_MODEL_DIR:-}" ] && [ ! -d "$DFLASH_PATH" ]; then
             die "DFlash2 weights missing at $DFLASH_PATH"
         fi
         nfs_share_weights
         return
     fi
     sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights" "$MODEL_SNAPSHOT"
-    if [ "$SPEC_METHOD" = "dflash" ]; then
+    # With DFLASH_MODEL_DIR set the operator owns draft staging on both
+    # ranks; the HF-cache draft sync is skipped.
+    if [ "$SPEC_METHOD" = "dflash" ] && [ -z "${DFLASH_MODEL_DIR:-}" ]; then
         [ -d "$DFLASH_PATH" ] || die "DFlash2 weights missing at $DFLASH_PATH"
         sync_repo_to_worker "$DFLASH_PATH" "$DFLASH_CACHE_NAME" "DFlash2 draft" "$DFLASH_REVISION"
     fi
@@ -1704,6 +1803,10 @@ GLM53_OVERLAY_ORDER=(
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    # patch_dflash2_exl3.py installs the mounted qwen3_dflash2.py and anchors
+    # the image's qwen3_dflash.py — no shared anchors with any overlay here;
+    # inert for BF16 drafts.
+    patch_dflash2_exl3.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
     patch_cache_reset.py
@@ -1962,6 +2065,10 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    [ -f "$DFLASH2_EXL3_PATCH_HOST" ] || die "missing $DFLASH2_EXL3_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DFLASH2_EXL3_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dflash2_exl3.py"
+    [ -f "$DFLASH2_MODEL_OVERLAY_HOST" ] || die "missing $DFLASH2_MODEL_OVERLAY_HOST"
+    scp -q -o BatchMode=yes "$DFLASH2_MODEL_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-qwen3_dflash2.py"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
@@ -2074,8 +2181,8 @@ launch_cluster() {
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M \
-             GLM53_COOP_GEOMETRY; do
+             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M GLM53_DENSE_EXL3 \
+             GLM53_DENSE_EXL3_PREFILL_BF16 GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2161,6 +2268,8 @@ launch_cluster() {
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_dflash2_exl3.py:/opt/glm53/patch_dflash2_exl3.py:ro' \
+        -v '/tmp/glm53-qwen3_dflash2.py:/opt/glm53/qwen3_dflash2.py:ro' \
         -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
@@ -2204,6 +2313,8 @@ launch_cluster() {
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$DFLASH2_EXL3_PATCH_HOST:/opt/glm53/patch_dflash2_exl3.py:ro" \
+        -v "$DFLASH2_MODEL_OVERLAY_HOST:/opt/glm53/qwen3_dflash2.py:ro" \
         -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
@@ -2262,6 +2373,8 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_SATURATE="$GLM53_ADAPTIVE_K_SATURATE" \
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
+        -e GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}" \
+        -e GLM53_DENSE_EXL3_PREFILL_BF16="$GLM53_DENSE_EXL3_PREFILL_BF16" \
         -e GLM53_EXL3_MOE_FAST="$GLM53_EXL3_MOE_FAST" \
         -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
@@ -2414,9 +2527,8 @@ start_unlocked() {
     write_inner_scripts
 
     MODEL_DIR="$(resolve_model_dir)"
-    DFLASH_MODEL_DIR=""
+    DFLASH_MODEL_DIR="$(select_dflash_model_dir)"
     if [ "$SPEC_METHOD" = "dflash" ]; then
-        DFLASH_MODEL_DIR="$(resolve_dflash_dir)"
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"

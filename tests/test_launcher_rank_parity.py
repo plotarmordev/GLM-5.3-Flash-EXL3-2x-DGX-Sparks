@@ -73,10 +73,13 @@ THIN = "GLM53_EXL3_MOE_FAST"
 # one-rank miss would silently leave that rank on Marlin, so the scenarios
 # below always require it.
 LARGE_M = "GLM53_KDA_BF16_LARGE_M"
+# Dense-EXL3 prefill BF16 retention set: same both-ranks contract — a
+# one-rank miss would retain on one rank only (different memory AND branch).
+PREFILL_BF16 = "GLM53_DENSE_EXL3_PREFILL_BF16"
 
 # Launcher knobs and the container-side names they map to.
 LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV, THIN,
-                  LARGE_M)
+                  LARGE_M, PREFILL_BF16)
 CONTAINER_NAMES = LAUNCHER_KNOBS + (
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA",
@@ -694,6 +697,9 @@ def part_d(h: Harness) -> None:
     scenarios += [("FAST=0", {THIN: "0"}), ("FAST=1", {THIN: "1"})]
     scenarios += [("LARGEM=0", {LARGE_M: "0"}),
                   ("LARGEM=1", {LARGE_M: "1"})]
+    scenarios += [("PREFILL=off", {PREFILL_BF16: "off"}),
+                  ("PREFILL=set", {PREFILL_BF16: "kda_in,shared_down,mla_qkv_a"}),
+                  ("PREFILL default, EXL3=1", {"GLM53_DENSE_EXL3": "1"})]
 
     first = None
     for label, env in scenarios:
@@ -715,6 +721,14 @@ def part_d(h: Harness) -> None:
             required[THIN] = env[THIN]
         if LARGE_M in env:
             required[LARGE_M] = env[LARGE_M]
+        if PREFILL_BF16 in env:
+            # Unset-only default: the measured retention set with
+            # GLM53_DENSE_EXL3=1, off otherwise.
+            required[PREFILL_BF16] = env[PREFILL_BF16]
+        elif env.get("GLM53_DENSE_EXL3") == "1":
+            required[PREFILL_BF16] = "kda_in,shared_down,mla_qkv_a"
+        else:
+            required[PREFILL_BF16] = "off"
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:

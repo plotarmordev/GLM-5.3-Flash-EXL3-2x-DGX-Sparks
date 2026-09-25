@@ -11,6 +11,95 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- Dense EXL3 for the non-routed linears (`GLM53_DENSE_EXL3`, default `0`,
+  experimental/opt-in; `overlay/exl3.py` `[dense-exl3]`, constructor
+  patches ride `overlay/patch_dense_fp8.py`): serve a pack whose
+  `quantization_config.non_routed_exl3` block declares EXL3 tensors for the
+  dense projections (turboderp 4.05bpw overlay: attn K6, shared K6, dense
+  MLP K5, mul1 codebook; 191 modules). Per module mutually exclusive with
+  `GLM53_DENSE_FP8` and with `ABLIT` — launchers refuse pre-stop, the
+  overlay refuses at load; a `non_routed_exl3` pack with the flag off
+  refuses to boot; TP=2 only. `GLM53_DENSE_EXL3_PREFILL_BF16` (unset
+  default `kda_in,shared_down,mla_qkv_a` with `GLM53_DENSE_EXL3=1`,
+  otherwise `off`; explicitly empty rejected) retains a load-time BF16
+  copy for a selected set of dense-EXL3
+  module types (comma list of `kda_in`, `kda_o`, `mla_qkv_a`, `mla_q_b`,
+  `mla_o`, `shared_gate_up`, `shared_down`, `dense_gate_up`, `dense_down`,
+  or `all`): every EXL3 shard is reconstructed once
+  (`get_weight_tensor`, hadamards pre-applied) and pre-concatenated with
+  any bf16 tail rows, and rows > 144 (exllamav3's own reconstruct
+  boundary) run one `F.linear` in the activation dtype — the same logical
+  weights; rows ≤ 144 stay on the EXL3 custom op, so decode is untouched.
+  `GLM53_KDA_BF16_LARGE_M=1` is kept as a backward-compatible alias for
+  `kda_in`. Cost is 2 bytes/weight per rank, logged per module and as one
+  boot summary line. Measured at
+  262k/2seqs/MNBT 1024/util 0.83 (README "Dense EXL3" section): quality at
+  parity with FP8 `dense,kda` (paired contrast +0.0012 nats,
+  CI [−0.0005, +0.0029]; top-1 94.39 vs 94.04), decode faster on every
+  probe (+2.9 to +10.7 %), KV pool +53 %, cold prefill −9.5 %
+  (−6.6 % with the large-M copy). Retention-set / lm_head / draft arm
+  numbers are in the README section; the full phase-2 gate results are in
+  `docs/dense-exl3-phase2-results.md`. Known limits in the README
+  EXL3 draft pack is staged). The
+  stock-profile CUDA-graph boot hang (exllamav3 coop autotuner tuning a
+  first-seen GEMM shape inside capture) is fixed by an eager
+  shape-x-row-bucket autotune warmup at the end of weight load.
+
+- Optional EXL3 `lm_head` for dense-EXL3 packs (pack builder
+  `--lm-head`; `overlay/exl3.py` `[dense-exl3]`): turboderp's 4.05bpw
+  lm_head K6 (mul1) served through `Exl3LinearMethod` on the
+  `ParallelLMHead` — exact-prefix dispatch (`language_model.lm_head`;
+  `embed_tokens` can never match), contiguous 77,440-row vocab shard per
+  rank at TP=2, padded==org vocab asserted at create, `head_dtype`
+  differing from the model dtype refused at load. The DFlash2 draft shares
+  the target's head module object, so its candidate step reads the EXL3
+  head through the same custom op; the coop-autotune warmup covers the
+  head shape. Boot summary reads 192 modules with the key, 191 without;
+  packs without the key see no behaviour change.
+
+- EXL3 DFlash2 draft serving (`overlay/exl3.py`, `overlay/patch_dflash2_exl3.py`,
+  `overlay/qwen3_dflash2.py`, `start.sh`): a draft snapshot whose
+  `config.json` declares `quantization_config.quant_method=exl3` with a
+  `non_routed_exl3` block is served through `Exl3LinearMethod` (q/o/mlp/
+  kernel_projection/fc at 6 bpw; k/v stay BF16 for the fused context-KV
+  precompute). `Exl3LinearMethod` accepts QKVParallelLinear's string shard
+  ids (`q`/`k`/`v`); the draft's checkpoint-relative `model.layers.N`
+  declarations are shifted to the runtime prefixes (offset by the target
+  layer count) at draft construction; `DFlashGroupedConv` threads
+  `quant_config` (hidden_projection stays BF16); the fused context-KV
+  weight is shape-guarded (full-BF16 layout slices q rows exactly as
+  before, EXL3 staging is used whole). Boot log gains
+  `[dense-exl3] draft: N EXL3 modules loaded` with staged bytes, plus the
+  declared-vs-built check for the draft. Launcher: select the staged local
+  snapshot via `DFLASH_MODEL=local/<name>` + `DFLASH_REVISION=<rev>` (syncs
+  to the worker like any draft), or override the resolved path with
+  `DFLASH_MODEL_DIR` (skips draft download check and worker sync; the
+  operator stages both ranks). The two in-image anchors and the
+  qwen3_dflash2.py install apply at container start on both ranks
+  (GLM53_OVERLAY_ORDER, host-mounted `patch_dflash2_exl3.py`, idempotent
+  and fail-closed) — no image rebuild required; the Dockerfile runs the
+  same patcher so a fresh build lands identical bytes. `create_weights`
+  reconciles the global tp_size vLLM stamps on ReplicatedLinear (the
+  draft's fc and conv kernel_projection are duplicated per rank, not
+  sharded) so the full pack tensors load whole at draft TP=2. The BF16
+  draft path is byte-identical. Measured (README table; gate details in
+  `docs/dense-exl3-phase2-results.md`): decode +2.8/+4.7/+1.3/+0.4 % vs
+  EH, KV +50–69 k, 200-prompt acceptance parity with the BF16 draft
+  (−0.02 pp, CI [−0.76, +0.72]), target logits unchanged (contrast
+  0.000000 CI ±0.0009); the pre-registered decode-path probe line is
+  missed by 0.19 pp at ±1.4 pp probe resolution — stated in the README
+  row, shipped as opt-in.
+
+- Vendored pack builders under `tools/`: `dense_overlay.py` builds the
+  dense-EXL3 overlay pack (Apache-2.0, from vcruz305/vllm-exl3 @78e1727
+  with the local `--local-quant` / resumable-read / `--lm-head`
+  modifications; header credits retained), and `dflash2_exl3_quant.sh`
+  (+ `dflash2_exl3_convert.py` / `dflash2_exl3_package.py`) builds the
+  EXL3 DFlash2 draft snapshot with MiaAI-Lab/exllamav3 pinned at
+  `63b32f0` (MIT): k/v BF16 for the fused context-KV weight,
+  kernel_projection + fc in the budget, 6.0 bpw default, servable
+  snapshot packaged with the `non_routed_exl3` block.
+
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not

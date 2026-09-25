@@ -253,6 +253,36 @@ def test_kda_bf16_large_m_flag_rejects_bad_values_before_host_actions() -> None:
             assert not harness.host_touching_calls(), (value, harness.calls())
 
 
+def test_dense_exl3_prefill_bf16_types_reject_bad_values_before_host_actions() -> None:
+    """GLM53_DENSE_EXL3_PREFILL_BF16 is a module-type list validated pre-stop.
+
+    ``overlay/exl3.py`` raises on unknown types at model load, so a typo
+    must not cost a running pair. The launcher's vocabulary is the
+    overlay's: kda_in, kda_o, mla_qkv_a, mla_q_b, mla_o, shared_gate_up,
+    shared_down, dense_gate_up, dense_down, plus all/off. Unset inherits
+    the GLM53_DENSE_EXL3-conditional default; an explicitly empty value
+    is an operator error, not off.
+    """
+    from test_launcher_rank_parity import Harness
+
+    with tempfile.TemporaryDirectory() as directory:
+        harness = Harness(Path(directory))
+        for value in ("off", "all", "0", "1", "kda_in",
+                      "kda_in,shared_down,mla_qkv_a", " KDA_IN , mla_o ",
+                      "kda_in,,kda_o"):
+            result = harness.run(
+                "validate_numeric_config", entry="start.fn.sh",
+                GLM53_DENSE_EXL3_PREFILL_BF16=value)
+            assert result.returncode == 0, (value, result.stderr)
+            assert not harness.host_touching_calls()
+        for value in ("kda", "shared", "kda-in", "foo", "all,kda_in",
+                      "kda_in,mla", "2", ""):
+            result = harness.run("restart", GLM53_DENSE_EXL3_PREFILL_BF16=value)
+            assert result.returncode == 2, (value, result.stderr)
+            assert "GLM53_DENSE_EXL3_PREFILL_BF16" in result.stderr, value
+            assert not harness.host_touching_calls(), (value, harness.calls())
+
+
 def test_tp3_kda_bf16_large_m_flag_is_0_or_1() -> None:
     """start-tp3.sh validates GLM53_KDA_BF16_LARGE_M before any stop."""
     guard = guard_source(ROOT / "start-tp3.sh")

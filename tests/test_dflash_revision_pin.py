@@ -135,8 +135,89 @@ printf 'resolved=%s\\n' "$(resolve_dflash_dir)"
         assert result.stdout.strip().endswith(f"/snapshots/{PIN}")
 
 
+def test_dflash_model_dir_override() -> None:
+    """select_dflash_model_dir: an operator-set DFLASH_MODEL_DIR (in-container
+    path to an EXL3 draft snapshot) is used as-is and never touches the HF
+    cache; unset resolves the pinned snapshot; SPEC_METHOD!=dflash yields
+    empty."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "models--local--dflash2-exl3-5bpw"
+        snap = repo / "snapshots" / "exl3-5bpw"
+        snap.mkdir(parents=True)
+        (snap / "config.json").touch()
+        (snap / "model.safetensors").touch()
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text("exl3-5bpw")
+
+        def run(spec_method: str, override: str | None) -> subprocess.CompletedProcess[str]:
+            script = f"""
+set -euo pipefail
+log() {{ :; }}
+die() {{ printf 'DIE:%s\\n' "$*" >&2; exit 97; }}
+{function("ensure_dflash_refs_main")}
+{function("resolve_dflash_dir")}
+{function("select_dflash_model_dir")}
+DFLASH_PATH={shlex.quote(str(repo))}
+DFLASH_CACHE_NAME=models--local--dflash2-exl3-5bpw
+DFLASH_REVISION=exl3-5bpw
+SPEC_METHOD={spec_method}
+DFLASH_MODEL_DIR={override if override is not None else ""}
+select_dflash_model_dir
+"""
+            return run_bash(script)
+
+        # override wins verbatim, no cache validation required
+        result = run("dflash", "/somewhere/else/exl3-draft")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "/somewhere/else/exl3-draft", result.stdout
+        # unset: pinned HF-cache resolution
+        result = run("dflash", None)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.endswith(
+            "/models--local--dflash2-exl3-5bpw/snapshots/exl3-5bpw"
+        ), result.stdout
+        # spec off: empty
+        result = run("mtp", None)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "", result.stdout
+        # override pointing at a missing snapshot still passes through (the
+        # operator owns staging); the pinned path must still validate
+        (snap / "model.safetensors").unlink()
+        result = run("dflash", None)
+        assert result.returncode == 97, result.stdout
+        result = run("dflash", "/somewhere/else/exl3-draft")
+        assert result.returncode == 0 and result.stdout == "/somewhere/else/exl3-draft"
+
+        # download check is skipped when the override is set (resolve_hf_bin
+        # would fail the script if reached)
+        script = f"""
+set -euo pipefail
+log() {{ :; }}
+die() {{ printf 'DIE:%s\\n' "$*" >&2; exit 97; }}
+{function("ensure_dflash_refs_main")}
+{function("resolve_dflash_dir")}
+{function("download_dflash")}
+resolve_hf_bin() {{ exit 99; }}
+DFLASH_PATH={shlex.quote(str(Path(tmp) / "nonexistent"))}
+DFLASH_CACHE_NAME=models--nope
+DFLASH_REVISION=
+DFLASH_MODEL=local/nope
+HF_CACHE_DIR={shlex.quote(tmp)}
+SPEC_METHOD=dflash
+SKIP_DOWNLOAD=0
+REFRESH_WEIGHTS=0
+DFLASH_MODEL_DIR=/somewhere/else/exl3-draft
+download_dflash
+echo DOWNLOAD-SKIPPED-OK
+"""
+        result = run_bash(script)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "DOWNLOAD-SKIPPED-OK", result.stdout
+
+
 if __name__ == "__main__":
     test_resolution_and_sync_marker_ignore_stale_main()
     test_revision_override_and_empty_value_survive_env()
+    test_dflash_model_dir_override()
     test_download_and_resolution_use_the_pin()
     print("dflash revision-pin guard OK")

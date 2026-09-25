@@ -1322,6 +1322,18 @@ def _check_dflash2() -> None:
     # Top-level is_causal must win so GLM-5.3-Flash-DFlash2 (is_causal=false,
     # all sliding_attention) does not silently draft as causal DFlash1.
     assert 'getattr(config, "is_causal", None)' in src
+    # [dense-exl3] EXL3 draft support: the quant-prefix shift runs before
+    # draft layer construction, the fused context-KV build is shape-guarded,
+    # and the overlay threads quant_config into the conv kernel_projections
+    # only (hidden_projection stays BF16).
+    assert "offset_draft_layer_prefixes(start_layer_id)" in src
+    assert "w.shape[0] == a.q_size + 2 * a.kv_size" in src
+    d2 = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash2.py"
+    ).read_text()
+    assert d2.count("quant_config=quant_config") == 4  # super() + conv ctor + 2 call sites
+    assert d2.count("quant_config=None") == 1  # hidden_projection only
+    assert "_log_draft_exl3(self.model)" in d2
     print("dflash2 overlay OK", flush=True)
 
 
