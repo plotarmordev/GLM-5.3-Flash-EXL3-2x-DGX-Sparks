@@ -358,6 +358,97 @@ behavioral drift and re-run `tests/bench_decode.py` after enabling (DFlash2
 acceptance can shift). Donor licensing: Dealign weights carry their own
 terms — see the donor card before redistributing anything derived.
 
+## Dense EXL3 for the non-routed linears (experimental, opt-in)
+
+`GLM53_DENSE_EXL3=1` serves a pack whose `quantization_config` carries a
+`non_routed_exl3` block: the dense/attn/shared projections run EXL3
+(turboderp 4.05bpw overlay — attn K6, shared K6, dense MLP K5, mul1
+codebook; 191 modules / 315 replaced tensors on GLM-5.3-Flash) instead of
+BF16. Requires `GLM53_DENSE_FP8=off` and `ABLIT=0` (refused otherwise);
+`GLM53_KDA_BF16_LARGE_M=1` is supported (below). Boot check: the log must
+show `[dense-exl3] 191 EXL3-dense modules loaded` — any other count means a
+pack/model mismatch (boots refuse loudly on that condition).
+
+### Building the overlay pack
+
+The overlay symlinks a TR3 snapshot and adds one safetensors of EXL3
+tensors range-read from turboderp/GLM-5.3-Flash-exl3. Build with
+[vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3) pinned at
+`78e1727`:
+
+```bash
+python3 tools/dense_overlay.py --branch 4.05bpw \
+    --src <TR3 snapshot dir> \
+    --out <overlay dir> \
+    --prefix-rewrite model.language_model.:language_model.model.
+python3 tools/dense_overlay.py --branch 4.05bpw \
+    --src <TR3 snapshot dir> --out <overlay dir> --verify
+```
+
+Expose the overlay as an HF-cache model: make its symlinks into the TR3
+snapshot **relative**, place it as
+`$HF_CACHE/hub/<MODEL_CACHE_NAME>/snapshots/<rev>`, and write `<rev>` into
+`<MODEL_CACHE_NAME>/refs/main` (a missing `refs/main` aborts the launch).
+`.env`:
+
+```bash
+MODEL_CACHE_NAME=models--local--glm53-dense-exl3-4.05bpw
+MODEL_REVISION=<rev>            # e.g. k6k5-4.05bpw
+GLM53_DENSE_EXL3=1
+GLM53_DENSE_FP8=off
+ABLIT=0
+GLM53_KDA_BF16_LARGE_M=1        # optional, see below
+```
+
+### Measured (TP=2, 262k ctx, 2 seqs, MNBT 1024, util 0.83)
+
+Paired teacher-forced contrast vs the same-boot BF16 reference; the
+same-boot BF16 floor is mean dNLL 0.00006 / top-1 95.15%. E = the 4.05bpw
+pack, F = `GLM53_DENSE_FP8=dense,kda`:
+
+| metric | E | F (FP8 dense) |
+|---|---|---|
+| mean dNLL vs BF16 | 0.0021 [0.0001, 0.0042] | 0.0009 [−0.0004, 0.0021] |
+| paired contrast E−F | +0.0012 nats, CI [−0.0005, +0.0029] ("not worse" bound passes) | — |
+| top-1 | 94.39 % | 94.04 % |
+| KL20 p99 | 0.178 | 0.199 |
+| decode vs F | structured +5.2 %, prose +10.7 %, code +2.9 %, code@32k +6.7 % | — |
+| KV pool | 1,174,231 tokens (+53 % vs F) | 769,100 |
+| cold prefill vs F | 0.905 / 0.911 / 0.902 at 8k / 32k / 96k (−9.5 %) | 1.0 |
+
+With `GLM53_KDA_BF16_LARGE_M=1` (load-time fp16 copy of the dequantized
+KDA in_proj q/k/v shards + the bf16 tail, serving M>512 prefill; ~3.3
+GiB/rank over 34 layers) cold prefill improves to 0.923 / 0.942 / 0.934
+(−6.6 %) and the KV pool settles at 915,337 tokens (+19 % vs F); quality
+is unchanged (same logical weights; the pooled mean dNLL measured 0.0007).
+
+With 7,168-token prefill chunks (same profile otherwise, speed only, two
+boots per arm) cold prefill is faster for every arm but the gap remains:
+E ~1,300 tok/s vs F ~1,480 (−12 %) vs BF16 ~1,495; decode vs F
+(structured / prose / code / code@32k) +2.2 % / +4.0 % / +3.1 % / +4.9 %;
+KV pool ~944k vs ~562k tokens (+68 %). At the
+stock profile (850k, 4 seqs, MNBT 7168, fixed 14 GiB pool) E boots and
+serves; cold prefill 1,307–1,329 vs 1,481–1,509 tok/s for BF16 (−12 %).
+The prefill cost is the EXL3 reconstruct path for M>144; it is not an
+artifact of small chunks.
+
+### Known limits
+
+- Cold prefill is ~10–12 % slower than FP8 dense (6.6 % with
+  `GLM53_KDA_BF16_LARGE_M=1` at MNBT 1024). Decode and KV headroom are the
+  gains; prompt-heavy workloads may prefer FP8 or BF16.
+- exllamav3's cooperative autotuner must never see a new GEMM shape inside
+  CUDA-graph capture (its stream sync deadlocks the boot; reproduced at the
+  stock profile and root-caused with py-spy). The overlay tunes every
+  dense-EXL3 shape x row bucket at the end of weight load, before capture,
+  and fails the boot if that tuning fails.
+- TP=2 only: `start-tp3.sh` refuses (shared-expert width 2048 is not
+  divisible by 3; the TP=3 head padding does not cover trellis tensors),
+  `start-tp4.sh` refuses (not wired).
+- `ABLIT=1` is incompatible: the pack quantizes o_proj on every layer, and
+  both sides refuse the combination.
+- lm_head and the DFlash2 draft stay BF16.
+
 ## Why the overlay exists
 
 Stock `vllm/vllm-openai:glm53-flash-arm64-cu130` loads this checkpoint and dies on
@@ -1364,6 +1455,7 @@ that are now documented/enforced:
 | `GLM53_ADAPTIVE_K` | `off` | `ema` = adaptive verification length (prose +13–21 %); needs the capture-size list in `EXTRA_ARGS`. See *Faster prose decode* |
 | `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1 |
 | `GLM53_DENSE_FP8` | `off` | `dense,kda` = FP8 weight-only (Marlin) dense projections, ~-11 ms/step; PROVISIONAL numerics. Groups: `shared,dense,kda,mla` |
+| `GLM53_DENSE_EXL3` | `0` | `1` = serve a `non_routed_exl3` pack (dense/attn/shared linears EXL3, mul1 codebook); requires `GLM53_DENSE_FP8=off` and `ABLIT=0`; `GLM53_KDA_BF16_LARGE_M=1` supported (load-time EXL3→BF16 in_proj copy for M>512); TP=2 only |
 | `ABLIT_METHOD` | `auto` | `auto` = transplant when `ablit/transplant/` is populated, else `proj` |
 | `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
 | `ABLIT_DIRECTION` | `dealign` | proj-only: `dealign` \| `bf_oproj` \| path to a custom `.pt` |
@@ -1630,6 +1722,13 @@ retains that license and the parent's third-party notices. DFlash2 stays [CC BY-
   [GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
   (uniform-K4 routed-experts, ShapleyMCG License 1.0). Public mirror for this
   recipe: [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
+- **Dense EXL3 (non-routed linears):** ported from
+  [Alexbob0/glm53-flash-dense-exl3-tp2](https://github.com/Alexbob0/glm53-flash-dense-exl3-tp2)
+  (MIT); the `Exl3LinearMethod` / `non_routed_exl3` design originates in
+  [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3) (Apache-2.0 at
+  the version vendored). Dense quants from
+  [turboderp/GLM-5.3-Flash-exl3](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3).
+  The AGPL-3.0 Alexbob0/glm53-flash-vllm-upstream-sm121 was not used.
 - **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
 - **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —

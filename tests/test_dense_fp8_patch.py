@@ -99,6 +99,54 @@ def main() -> int:
         compile(kt, "kda.py", "exec"); compile(mt, "model.py", "exec")
         subprocess.check_call([sys.executable, str(PATCH)], env=env)  # idempotent
         assert (site / "models/glm5next/nvidia/kda.py").read_text() == kt
+
+        # GLM53_DENSE_EXL3=1 with FP8 off patches the same two sites once
+        env["GLM53_DENSE_FP8"] = "off"
+        env["GLM53_DENSE_EXL3"] = "1"
+        subprocess.check_call([sys.executable, str(PATCH)], env=env)
+        assert kt.count("[glm53-dense-fp8]") == 1  # same mark, still one edit
+        subprocess.check_call([sys.executable, str(PATCH)], env=env)  # idempotent
+        assert (site / "models/glm5next/nvidia/kda.py").read_text() == kt
+
+        # GLM53_DENSE_EXL3=0 + a pack carrying non_routed_exl3: refuse, files untouched
+        pack = Path(tmp) / "pack"; pack.mkdir()
+        (pack / "config.json").write_text(
+            '{"quantization_config": {"non_routed_exl3": {"layers": {}}}}')
+        env["GLM53_DENSE_EXL3"] = "0"
+        env["MODEL_DIR"] = str(pack)
+        proc = subprocess.run([sys.executable, str(PATCH)], env=env,
+                              capture_output=True, text=True)
+        assert proc.returncode != 0 and "non_routed_exl3" in proc.stderr, proc.stderr
+        assert (site / "models/glm5next/nvidia/kda.py").read_text() == kt
+        del env["MODEL_DIR"]
+
+        # drift: a duplicated kda anchor refuses with the file untouched
+        drifted = Path(tmp) / "drift"
+        (drifted / "models/glm5next/nvidia").mkdir(parents=True)
+        (drifted / "model_executor/layers/quantization").mkdir(parents=True)
+        shutil.copyfile(KDA_SRC, drifted / "models/glm5next/nvidia/kda.py")
+        shutil.copyfile(MODEL_SRC, drifted / "models/glm5next/nvidia/model.py")
+        shutil.copyfile(ROOT / "overlay" / "exl3.py",
+                        drifted / "model_executor/layers/quantization/exl3.py")
+        dk = drifted / "models/glm5next/nvidia/kda.py"
+        dk.write_text(dk.read_text().replace(
+            "        vllm_config.quant_config = None\n",
+            "        vllm_config.quant_config = None\n"
+            "        vllm_config.quant_config = None\n", 1))
+        before = dk.read_text()
+        env["GLM53_DENSE_EXL3"] = "1"
+        env["GLM53_SITE"] = str(drifted)
+        proc = subprocess.run([sys.executable, str(PATCH)], env=env,
+                              capture_output=True, text=True)
+        assert proc.returncode != 0 and "expected one" in proc.stderr, proc.stderr
+        assert dk.read_text() == before, "drift refusal must leave the file untouched"
+
+        # GLM53_DENSE_EXL3 must be exactly 0 or 1
+        env["GLM53_SITE"] = str(site)
+        env["GLM53_DENSE_EXL3"] = "true"
+        proc = subprocess.run([sys.executable, str(PATCH)], env=env,
+                              capture_output=True, text=True)
+        assert proc.returncode != 0 and "0 or 1" in proc.stderr, proc.stderr
     print("dense-fp8 patch OK")
     return 0
 
